@@ -561,16 +561,64 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
     .file-title { font-weight: 600; font-size: 14px; color: #1e293b; word-break: break-all; }
     .file-actions { display: flex; gap: 8px; justify-content: flex-end; }
     
+    /* スプリットビュー & レイアウトコンテナ */
+    .container { flex: 1; max-width: 980px; width: 100%; margin: 28px auto; padding: 0 16px; transition: max-width 0.25s ease-in-out; }
+    .container.has-preview { max-width: 1560px; }
+    .main-layout { display: flex; flex-direction: column; gap: 24px; width: 100%; }
+
+    @media (min-width: 1024px) {
+      .main-layout.has-preview {
+        display: grid;
+        grid-template-columns: minmax(420px, 480px) minmax(560px, 1fr);
+        align-items: start;
+        gap: 24px;
+      }
+      .files-card {
+        position: sticky;
+        top: 20px;
+      }
+      .preview-card {
+        position: sticky;
+        top: 20px;
+        max-height: calc(100vh - 40px);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .preview-body {
+        flex: 1;
+        overflow-y: auto;
+      }
+      .preview-body iframe {
+        height: calc(100vh - 120px) !important;
+        min-height: 600px;
+      }
+    }
+
+    @media (max-width: 1023px) {
+      .preview-card {
+        margin-top: 16px;
+      }
+      .preview-body iframe {
+        height: 550px;
+      }
+    }
+
+    .file-row-active {
+      background-color: #eff6ff !important;
+      border-left: 3px solid #2563eb;
+    }
+
     /* プレビューコンテナ */
-    .preview-section { margin-top: 28px; border: 1px solid #cbd5e1; border-radius: 10px; overflow: hidden; background: #ffffff; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
-    .preview-header { padding: 12px 20px; background: #f1f5f9; border-bottom: 1px solid #e2e8f0; display: flex; align-items: center; justify-content: space-between; }
-    .preview-header-title { font-weight: 600; font-size: 14px; color: #334155; display: flex; align-items: center; gap: 8px; }
-    .preview-body { min-height: 500px; display: flex; align-items: center; justify-content: center; background: #525659; }
+    .preview-card { border: 1px solid #cbd5e1; border-radius: 12px; overflow: hidden; background: #ffffff; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.08); padding: 0; }
+    .preview-header { padding: 12px 18px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .preview-header-title { font-weight: 600; font-size: 14px; color: #1e293b; display: flex; align-items: center; gap: 8px; min-width: 0; }
+    #preview-filename-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .preview-body { min-height: 480px; display: flex; align-items: center; justify-content: center; background: #525659; }
     .preview-body iframe { width: 100%; height: 750px; border: none; background: #fff; }
     .preview-body img { max-width: 100%; max-height: 750px; border-radius: 4px; object-fit: contain; }
     .preview-body pre { width: 100%; height: 600px; margin: 0; padding: 20px; background: #ffffff; color: #1e293b; overflow: auto; font-family: monospace; font-size: 13px; line-height: 1.5; }
-    
-    .footer { text-align: center; padding: 24px; font-size: 12px; color: #94a3b8; }
+.footer { text-align: center; padding: 24px; font-size: 12px; color: #94a3b8; }
     """
 
     err_html = f'<div class="alert-error">{error_msg}</div>' if error_msg else ""
@@ -635,7 +683,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
             """
             
             rows_html += f"""
-            <tr>
+            <tr class="file-row" id="file-row-{idx}">
               <td>
                 <div class="file-cell">
                   <div class="file-icon">{ficon}</div>
@@ -663,7 +711,8 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
             auto_preview_js = f"showPreview('0', {first_fname_json});"
 
         content = f"""
-        <div class="card">
+        <div class="main-layout" id="main-layout">
+        <div class="card files-card">
           <div class="summary-box">
             <div>
               <div class="summary-title">{title}</div>
@@ -691,22 +740,23 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
               {rows_html}
             </tbody>
           </table>
+        </div>
 
-          <div id="preview-section" class="preview-section" style="display: none;">
-            <div class="preview-header">
-              <div class="preview-header-title">
-                <span>👁️</span>
-                <span id="preview-filename-label">ファイルプレビュー</span>
-              </div>
-              <div style="display: flex; gap: 8px;">
-                <a id="preview-download-link" href="#" class="btn btn-secondary btn-sm">⬇️ このファイルを保存</a>
-                <button type="button" class="btn btn-secondary btn-sm" onclick="closePreview()">✕ 閉じる</button>
-              </div>
+        <div id="preview-section" class="card preview-card" style="display: none;">
+          <div class="preview-header">
+            <div class="preview-header-title">
+              <span>👁️</span>
+              <span id="preview-filename-label">ファイルプレビュー</span>
             </div>
-            <div id="preview-body" class="preview-body">
-              <!-- 動的プレビュー読み込み領域 -->
+            <div style="display: flex; gap: 8px;">
+              <a id="preview-download-link" href="#" class="btn btn-secondary btn-sm">⬇️ このファイルを保存</a>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="closePreview()">✕ 閉じる</button>
             </div>
           </div>
+          <div id="preview-body" class="preview-body">
+            <!-- 動的プレビュー読み込み領域 -->
+          </div>
+        </div>
         </div>
 
         <script>
@@ -1090,11 +1140,23 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
             var section = document.getElementById('preview-section');
             var label = document.getElementById('preview-filename-label');
             var dlLink = document.getElementById('preview-download-link');
+            var layout = document.getElementById('main-layout');
+            var container = document.querySelector('.container');
             
+            if (layout) layout.classList.add('has-preview');
+            if (container) container.classList.add('has-preview');
+            
+            document.querySelectorAll('.file-row').forEach(function(r) {{ r.classList.remove('file-row-active'); }});
+            var activeRow = document.getElementById('file-row-' + fileId);
+            if (activeRow) activeRow.classList.add('file-row-active');
+
             label.textContent = filename;
             dlLink.href = '/share/' + encodeURIComponent(currentToken) + '/file/' + encodeURIComponent(fileId) + '/download';
-            section.style.display = 'block';
-            section.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            section.style.display = 'flex';
+            
+            if (window.innerWidth < 1024) {{
+              section.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            }}
             
             var contentUrl = '/share/' + encodeURIComponent(currentToken) + '/file/' + encodeURIComponent(fileId) + '/content';
             renderPreviewContent(contentUrl, filename);
@@ -1209,7 +1271,15 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
           }}
 
           function closePreview() {{
-            document.getElementById('preview-section').style.display = 'none';
+            var section = document.getElementById('preview-section');
+            var layout = document.getElementById('main-layout');
+            var container = document.querySelector('.container');
+            
+            if (layout) layout.classList.remove('has-preview');
+            if (container) container.classList.remove('has-preview');
+            document.querySelectorAll('.file-row').forEach(function(r) {{ r.classList.remove('file-row-active'); }});
+
+            if (section) section.style.display = 'none';
             document.getElementById('preview-body').innerHTML = '';
           }}
 
