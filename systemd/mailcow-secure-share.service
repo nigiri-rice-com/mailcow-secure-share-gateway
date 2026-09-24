@@ -1,0 +1,14 @@
+[Unit]
+Description=OmusuBI Secure Share Gateway (外部共有専用メールOTP認証&暗号化ゲートウェイ)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mailcow-attachment-linker
+ExecStart=/usr/bin/python3 /opt/mailcow-attachment-linker/secure_share_gateway.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
