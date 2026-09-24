@@ -138,8 +138,53 @@ def send_sender_notification(mail_from: str, subject: str, text_content: str, ht
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     proc.communicate(input=msg.as_bytes())
 
-def notify_sender_hold(mail_from: str, rcpt_tos: list, subject: str, cancel_token: str, delay: int, attach_count: int):
+def notify_sender_rejected(mail_from: str, rcpt_tos: list, subject: str, reason: str):
+    rcpt_str = ", ".join(rcpt_tos)
+    mail_subject = f"【送信却下・差し戻し】社外宛てメールが却下されました（{subject}）"
+    text_body = f"""OmusuBI 誤送信防止システムからのお知らせです。
+
+保留中だった社外宛てメールの送信は、上長または管理者により却下（差し戻し）されました。
+相手先へのメール配送は行われておりません。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+■ 件名: {subject}
+■ 宛先: {rcpt_str}
+■ 却下理由: {reason}
+■ 却下日時: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+必要に応じて内容を修正し、再度送信を行ってください。
+"""
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1f2937; padding: 20px;">
+  <div style="max-width: 540px; margin: 0 auto; background: #ffffff; border: 1px solid #ef4444; border-radius: 10px; padding: 24px;">
+    <div style="display: flex; align-items: center; gap: 8px; border-bottom: 2px solid #dc2626; padding-bottom: 12px; margin-bottom: 16px;">
+      <span style="font-size: 24px;">🛑</span>
+      <h2 style="margin: 0; color: #b91c1c; font-size: 17px;">メールの送信が却下されました（差し戻し）</h2>
+    </div>
+    <p style="font-size: 14px; margin-bottom: 16px;">
+      保留中の社外宛てメールは、上長または管理者により送信が却下されました。<br>
+      宛先へのメール配送は中止されております。
+    </p>
+    <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 14px 18px; font-size: 13px; margin-bottom: 16px;">
+      <div><strong>件名:</strong> {subject}</div>
+      <div style="margin-top: 4px;"><strong>宛先:</strong> {rcpt_str}</div>
+      <div style="margin-top: 6px; color: #991b1b;"><strong>却下理由:</strong> {reason}</div>
+    </div>
+    <p style="font-size: 12px; color: #6b7280; margin: 0;">
+      ※ 内容を修正の上、改めて送信をお願いいたします。
+    </p>
+  </div>
+</body>
+</html>"""
+    send_sender_notification(mail_from, mail_subject, text_body, html_body)
+
+def notify_sender_hold(mail_from: str, rcpt_tos: list, subject: str, cancel_token: str, delay: int, attach_count: int, approve_token: str = "", bundle_token: str = "", mgmt_key: str = ""):
     cancel_url = f"{PUBLIC_BASE_URL}/outbound/cancel/{cancel_token}"
+    approve_url = f"{PUBLIC_BASE_URL}/outbound/approve/{approve_token}" if approve_token else ""
+    manage_url = f"{PUBLIC_BASE_URL}/share/{bundle_token}/manage?key={mgmt_key}" if (bundle_token and mgmt_key) else ""
     rcpt_str = ", ".join(rcpt_tos)
     
     mail_subject = f"【送信保留中・{delay}秒】社外宛てメールの送信を取り消せます（{subject}）"
@@ -158,15 +203,52 @@ def notify_sender_hold(mail_from: str, rcpt_tos: list, subject: str, cancel_toke
 
 ▼ 送信取り消し（キャンセル）リンク:
 <{cancel_url}>
+"""
+    if approve_url:
+        text_body += f"""
+▼ 上長承認用ポータルリンク（承認依頼を行う場合はこちら）:
+<{approve_url}>
+"""
+    if manage_url:
+        text_body += f"""
+▼ 送信後ファイル共有管理・即時無効化（キルスイッチ）URL:
+<{manage_url}>
+※ 相手先へ配送完了した後でも、このURLからワンクリックで共有リンクを即時無効化（アクセス遮断）できます。
+"""
+    text_body += f"""
+※ 取り消す必要がない場合は、何もしなくて構いません。{delay} 秒経過後に自動的に社外へ配送されます。
+"""
 
-※ {delay} 秒経過後は自動的に宛先へ配送されます。取り消す必要がない場合はそのままお待ちください。
+    manage_box_html = ""
+    if manage_url:
+        manage_box_html = f"""
+      <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 14px 18px; margin-top: 16px; font-size: 13px;">
+        <div style="font-weight: bold; color: #0369a1; margin-bottom: 4px;">🛡️ 配送後の即時無効化（キルスイッチ）について</div>
+        <p style="margin: 0 0 8px 0; font-size: 12px; color: #475569;">
+          万一、送信後に添付ファイルの間違いに気づいた場合でも、以下の管理画面からいつでも相手先の閲覧・ダウンロードを即座に停止できます。
+        </p>
+        <a href="{manage_url}" style="color: #0284c7; font-weight: bold; font-size: 13px; text-decoration: underline;">
+          🔗 共有リンク管理画面を開く（即時無効化ボタンあり）
+        </a>
+      </div>
+"""
+
+    approve_box_html = ""
+    if approve_url:
+        approve_box_html = f"""
+      <div style="margin-top: 16px; text-align: center; border-top: 1px dashed #e2e8f0; padding-top: 14px;">
+        <span style="font-size: 12px; color: #64748b;">👔 社内承認ワークフローをご利用の場合:</span><br>
+        <a href="{approve_url}" style="color: #2563eb; font-size: 13px; font-weight: bold; text-decoration: underline; margin-top: 4px; display: inline-block;">
+          上長承認用ポータル画面を開く（即時承認・差し戻し）
+        </a>
+      </div>
 """
 
     html_body = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
 <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1f2937; padding: 20px;">
-  <div style="max-width: 560px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 24px;">
+  <div style="max-width: 580px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 24px;">
     <div style="display: flex; align-items: center; gap: 8px; border-bottom: 2px solid #f59e0b; padding-bottom: 12px; margin-bottom: 16px;">
       <span style="font-size: 24px;">⏳</span>
       <h2 style="margin: 0; color: #b45309; font-size: 17px;">社外宛てメールを送信保留しています（誤送信防止）</h2>
@@ -180,7 +262,7 @@ def notify_sender_hold(mail_from: str, rcpt_tos: list, subject: str, cancel_toke
       <div style="margin-top: 4px;"><strong>宛先:</strong> {rcpt_str}</div>
       <div style="margin-top: 4px;"><strong>添付ファイル:</strong> {attach_count} 件</div>
     </div>
-    <div style="text-align: center; margin: 24px 0;">
+    <div style="text-align: center; margin: 20px 0;">
       <a href="{cancel_url}" style="background-color: #dc2626; color: #ffffff !important; text-decoration: none; padding: 12px 28px; border-radius: 6px; font-weight: bold; font-size: 14px; display: inline-block;">
         🛑 このメールの送信を取り消す
       </a>
@@ -188,6 +270,10 @@ def notify_sender_hold(mail_from: str, rcpt_tos: list, subject: str, cancel_toke
         取り消しURL: <a href="{cancel_url}" style="color: #2563eb;">{cancel_url}</a>
       </div>
     </div>
+
+    {manage_box_html}
+    {approve_box_html}
+
     <p style="font-size: 12px; color: #6b7280; margin-top: 20px; border-top: 1px dashed #e2e8f0; padding-top: 12px;">
       ※ 取り消す必要がない場合は、何もしなくて構いません。{delay} 秒後に自動的に社外へ配送されます。
     </p>
@@ -370,9 +456,11 @@ class OutboundHandler:
                         })
                         
                     # バンドルメタデータの保存
+                    mgmt_key = secrets.token_urlsafe(24)
                     bundle_metadata = {
                         "type": "bundle",
                         "token": bundle_token,
+                        "mgmt_key": mgmt_key,
                         "subject": subject or "添付ファイル一式",
                         "mail_from": mail_from,
                         "total_size": total_bundle_size,
@@ -380,7 +468,11 @@ class OutboundHandler:
                         "recipients_hashes": recipients_hashes,
                         "created_at": datetime.datetime.now().isoformat(),
                         "expire_days": EXPIRE_DAYS,
-                        "files": files_meta
+                        "status": "active",
+                        "files": files_meta,
+                        "download_count": 0,
+                        "view_count": 0,
+                        "logs": []
                     }
                     
                     meta_path = os.path.join(STORAGE_DIR, f"{bundle_token}.meta")
@@ -548,14 +640,25 @@ class OutboundHandler:
             
             if delay > 0 and is_external and not is_bypass:
                 cancel_token = secrets.token_urlsafe(16)
+                approve_token = secrets.token_urlsafe(16)
                 os.makedirs(PENDING_DIR, exist_ok=True)
                 pending_file = os.path.join(PENDING_DIR, f"{cancel_token}.json")
                 
+                current_bundle_token = bundle_token if 'bundle_token' in locals() else None
+                current_mgmt_key = mgmt_key if 'mgmt_key' in locals() else None
+                att_list = [{"filename": f["filename"], "size": f["size"]} for f in files_meta] if 'files_meta' in locals() and files_meta else []
+                preview_text = plain_content[:500] if 'plain_content' in locals() and plain_content else ""
+
                 pending_info = {
                     "cancel_token": cancel_token,
+                    "approve_token": approve_token,
+                    "bundle_token": current_bundle_token,
+                    "mgmt_key": current_mgmt_key,
                     "mail_from": mail_from,
                     "rcpt_tos": rcpt_tos,
                     "subject": subject,
+                    "body_preview": preview_text,
+                    "attachments": att_list,
                     "status": "pending",
                     "created_at": datetime.datetime.now().isoformat(),
                     "expires_at": time.time() + delay
@@ -564,18 +667,24 @@ class OutboundHandler:
                     json.dump(pending_info, pf, indent=2, ensure_ascii=False)
                 os.chmod(pending_file, 0o600)
 
-                # 送信者へ送信取り消し通知メールを配送
-                attach_count = len(attachments) if 'attachments' in locals() and attachments else 0
+                # 送信者へ送信取り消し・承認・管理通知メールを配送
+                attach_count = len(att_list)
                 try:
-                    notify_sender_hold(mail_from, rcpt_tos, subject, cancel_token, delay, attach_count)
+                    notify_sender_hold(
+                        mail_from, rcpt_tos, subject, cancel_token, delay, attach_count,
+                        approve_token=approve_token, bundle_token=current_bundle_token, mgmt_key=current_mgmt_key
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to notify sender of hold: {e}")
 
                 logger.info(f"Delaying outbound delivery for {delay} seconds (cancel_token={cancel_token}, to={rcpt_tos})")
 
-                # 保留カウントダウン（キャンセル検出ループ）
+                # 保留カウントダウン（キャンセル・上長承認・却下検出ループ）
                 elapsed = 0
                 is_cancelled = False
+                is_approved = False
+                is_rejected = False
+                reject_reason = ""
                 while elapsed < delay:
                     await asyncio.sleep(1.0)
                     elapsed += 1
@@ -585,8 +694,17 @@ class OutboundHandler:
                     try:
                         with open(pending_file, "r", encoding="utf-8") as pf:
                             cur_p = json.load(pf)
-                            if cur_p.get("status") == "cancelled":
+                            st = cur_p.get("status")
+                            if st == "cancelled":
                                 is_cancelled = True
+                                break
+                            elif st == "approved":
+                                is_approved = True
+                                logger.info(f"Outbound mail APPROVED by approver early: {mail_from} -> {rcpt_tos}")
+                                break
+                            elif st == "rejected":
+                                is_rejected = True
+                                reject_reason = cur_p.get("reject_reason", "上長により却下されました")
                                 break
                     except Exception:
                         pass
@@ -603,6 +721,19 @@ class OutboundHandler:
                     except Exception as e:
                         logger.warning(f"Failed to notify sender of cancellation: {e}")
                     return "250 2.0.0 Message delivery cancelled by sender"
+
+                if is_rejected:
+                    logger.info(f"Outbound delivery REJECTED by supervisor for {mail_from} -> {rcpt_tos}")
+                    try:
+                        if os.path.exists(pending_file):
+                            os.remove(pending_file)
+                    except Exception:
+                        pass
+                    try:
+                        notify_sender_rejected(mail_from, rcpt_tos, subject, reject_reason)
+                    except Exception as e:
+                        logger.warning(f"Failed to notify sender of rejection: {e}")
+                    return "250 2.0.0 Message delivery rejected by supervisor"
 
                 # 保留期間終了
                 try:

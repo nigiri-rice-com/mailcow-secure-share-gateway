@@ -54,6 +54,8 @@ OTP_RESEND_COOLDOWN = 60  # 60秒
 OTP_MAX_ATTEMPTS = 5      # 最大5回試行
 SESSION_EXPIRY_SECONDS = 3600  # 1時間
 EXPIRE_DAYS = 60
+ADMIN_PASSWORD = os.environ.get("SECURE_SHARE_ADMIN_PASSWORD", "OmusuBI@Admin2026!")
+ADMIN_SESSION_EXPIRY = 28800  # 8時間
 
 # ロギング設定 (平文OTPや秘密鍵の出力を完全禁止)
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -367,6 +369,74 @@ def get_normalized_metadata(token: str) -> dict | None:
             "files": [file_obj],
             "total_size": size
         }
+
+
+def save_metadata(token: str, meta: dict):
+    """メタデータを安全に保存"""
+    meta_path = os.path.join(STORAGE_DIR, f"{token}.meta")
+    tmp_path = f"{meta_path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, meta_path)
+        os.chmod(meta_path, 0o600)
+    except Exception as e:
+        logger.error(f"Failed to save metadata for token {token}: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+def is_share_revoked(meta: dict) -> bool:
+    """共有リンクが即時無効化（キルスイッチ発動）されているか判定"""
+    return meta.get("status") == "revoked"
+
+def log_audit_event(meta: dict, token: str, action: str, details: str = "", ip: str = ""):
+    """監査ログをメタデータに記録"""
+    if "logs" not in meta:
+        meta["logs"] = []
+    meta["logs"].append({
+        "timestamp": datetime.now().isoformat(),
+        "action": action,
+        "details": details,
+        "ip": ip
+    })
+    if len(meta["logs"]) > 50:
+        meta["logs"] = meta["logs"][-50:]
+    save_metadata(token, meta)
+
+def create_admin_session(kek: bytes) -> str:
+    ts = int(time.time())
+    data = f"admin:{ts}".encode("utf-8")
+    sig = hmac.new(kek, data, hashlib.sha256).hexdigest()
+    return f"admin:{ts}:{sig}"
+
+def verify_admin_session(token_str: str, kek: bytes) -> bool:
+    if not token_str:
+        return False
+    parts = token_str.split(":")
+    if len(parts) != 3 or parts[0] != "admin":
+        return False
+    try:
+        ts = int(parts[1])
+        if time.time() - ts > ADMIN_SESSION_EXPIRY:
+            return False
+        expected = hmac.new(kek, f"admin:{ts}".encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(parts[2], expected)
+    except Exception:
+        return False
+
+def is_authorized_manager(request: web.Request, meta: dict, kek: bytes) -> bool:
+    """送信者本人（管理キー所持）または管理者セッションを検証"""
+    admin_cookie = request.cookies.get("secure_share_admin_session")
+    if verify_admin_session(admin_cookie, kek):
+        return True
+    key = request.query.get("key") or (request.match_info.get("key") if "key" in request.match_info else None)
+    mgmt_key = meta.get("mgmt_key")
+    if key and mgmt_key and hmac.compare_digest(key, mgmt_key):
+        return True
+    return False
 
 def is_share_expired(meta: dict) -> bool:
     created_at = meta.get("created_at")
@@ -843,12 +913,16 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
                 var grid = new THREE.GridHelper(100, 20, 0x475569, 0x1e293b);
                 scene.add(grid);
 
+                var initialCameraPos = new THREE.Vector3();
+                var initialTarget = new THREE.Vector3(0, 0, 0);
+
                 function fitCameraToMesh(object) {{
                   var box = new THREE.Box3().setFromObject(object);
                   var size = box.getSize(new THREE.Vector3());
                   var center = box.getCenter(new THREE.Vector3());
                   object.position.sub(center);
                   var maxDim = Math.max(size.x, size.y, size.z);
+                  if (maxDim <= 0) maxDim = 10;
                   var fov = camera.fov * (Math.PI / 180);
                   var cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2)) * 1.8;
                   camera.position.set(maxDim * 0.8, maxDim * 0.8, cameraZ);
@@ -856,6 +930,10 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
                   controls.target.set(0, 0, 0);
                   controls.update();
                   grid.position.y = -size.y / 2;
+
+                  initialCameraPos.copy(camera.position);
+                  initialTarget.copy(controls.target);
+                  controls.saveState();
                 }}
 
                 var material = new THREE.MeshStandardMaterial({{
@@ -906,7 +984,13 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
                 }}
 
                 document.getElementById('btn-reset-3d').onclick = function() {{
+                  if (initialCameraPos.lengthSq() > 0) {{
+                    camera.position.copy(initialCameraPos);
+                    controls.target.copy(initialTarget);
+                    camera.lookAt(initialTarget);
+                  }}
                   controls.reset();
+                  controls.update();
                 }};
 
                 function animate() {{
@@ -1441,11 +1525,564 @@ def render_cancel_page(status: str, mail_from: str = "", rcpt_tos: list = None, 
 
 # === Web ルートハンドラ ===
 
+
+def render_revoked_page(meta: dict) -> str:
+    """共有リンク無効化（キルスイッチ発動）の通知画面"""
+    subject = html.escape(meta.get("subject") or "共有ファイル")
+    mail_from = html.escape(meta.get("mail_from") or "送信者")
+    revoked_at = meta.get("revoked_at")
+    revoked_str = datetime.fromisoformat(revoked_at).strftime("%Y-%m-%d %H:%M:%S") if revoked_at else "日時不明"
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>共有リンク無効化のお知らせ - OmusuBI Secure Share</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }}
+    .card {{ background: #1e293b; border: 1px solid #dc2626; border-radius: 16px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5), 0 0 20px rgba(220,38,38,0.2); max-width: 540px; width: 100%; padding: 40px 32px; text-align: center; }}
+    .icon {{ font-size: 56px; margin-bottom: 20px; }}
+    h1 {{ font-size: 22px; color: #f87171; margin: 0 0 12px; font-weight: 700; }}
+    p {{ font-size: 14px; color: #cbd5e1; line-height: 1.7; margin: 0 0 24px; }}
+    .info-box {{ background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px 20px; text-align: left; font-size: 13px; color: #94a3b8; margin-bottom: 24px; }}
+    .info-row {{ display: flex; margin-bottom: 8px; }}
+    .info-row:last-child {{ margin-bottom: 0; }}
+    .info-label {{ font-weight: 600; width: 90px; color: #e2e8f0; flex-shrink: 0; }}
+    .badge {{ display: inline-block; padding: 4px 12px; background: rgba(220,38,38,0.2); border: 1px solid #dc2626; border-radius: 20px; color: #fca5a5; font-size: 12px; font-weight: 600; margin-bottom: 20px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🛑</div>
+    <div class="badge">キルスイッチ発動・アクセス停止</div>
+    <h1>共有リンクは無効化されました</h1>
+    <p>
+      このファイル共有リンクは、送信者または管理者により<strong>即時無効化（取り消し）</strong>されました。<br>
+      セキュリティ保護のため、確認コードの発行およびファイルのプレビュー・ダウンロードは行えません。
+    </p>
+    <div class="info-box">
+      <div class="info-row"><span class="info-label">件名:</span><span>{subject}</span></div>
+      <div class="info-row"><span class="info-label">送信元:</span><span>{mail_from}</span></div>
+      <div class="info-row"><span class="info-label">無効化日時:</span><span>{revoked_str}</span></div>
+    </div>
+    <div style="font-size: 12px; color: #64748b;">
+      ※ ファイルの再共有が必要な場合は、送信元へ直接ご連絡ください。
+    </div>
+  </div>
+</body>
+</html>"""
+
+def render_manage_page(token: str, meta: dict, key: str, is_admin: bool, message: str = "", error: str = "") -> str:
+    """送信者・管理者向け 共有リンク管理画面（キルスイッチ・ステータス確認）"""
+    subject = html.escape(meta.get("subject") or "共有ファイル一式")
+    mail_from = html.escape(meta.get("mail_from") or "")
+    total_size = format_size(meta.get("total_size", 0))
+    created_at = meta.get("created_at", "")
+    created_str = datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M:%S") if created_at else ""
+    expire_days = meta.get("expire_days", 60)
+    
+    is_rev = is_share_revoked(meta)
+    is_exp = is_share_expired(meta)
+    
+    if is_rev:
+        status_badge = '<span style="background:#ef4444; color:#fff; padding:4px 12px; border-radius:20px; font-weight:bold; font-size:12px;">🛑 無効化中（キルスイッチ作動）</span>'
+    elif is_exp:
+        status_badge = '<span style="background:#64748b; color:#fff; padding:4px 12px; border-radius:20px; font-weight:bold; font-size:12px;">⌛ 有効期限切れ</span>'
+    else:
+        status_badge = '<span style="background:#10b981; color:#fff; padding:4px 12px; border-radius:20px; font-weight:bold; font-size:12px;">🟢 共有中（正常稼働）</span>'
+
+    files = meta.get("files", [])
+    file_rows = ""
+    for idx, f in enumerate(files, start=1):
+        fname = html.escape(f.get("filename", "file"))
+        fsize = format_size(f.get("size", 0))
+        file_rows += f"""
+        <tr>
+          <td style="padding:10px 14px; border-bottom:1px solid #334155; font-size:13px; color:#e2e8f0;">{idx}. {fname}</td>
+          <td style="padding:10px 14px; border-bottom:1px solid #334155; font-size:13px; color:#94a3b8; text-align:right;">{fsize}</td>
+        </tr>
+        """
+
+    dl_count = meta.get("download_count", 0)
+    
+    share_url = f"{PUBLIC_BASE_URL}/share/{token}"
+
+    if not is_rev:
+        action_btn = f"""
+        <form method="POST" action="/share/{token}/api/revoke" onsubmit="return confirm('本当にこの共有リンクを即時無効化しますか？\\n相手先からのアクセスおよびダウンロードが直ちに遮断されます。');">
+          <input type="hidden" name="key" value="{html.escape(key)}">
+          <button type="submit" style="background:#dc2626; color:#fff; border:none; padding:12px 28px; border-radius:8px; font-weight:bold; font-size:14px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; box-shadow:0 4px 12px rgba(220,38,38,0.3);">
+            <span>🛑</span> この共有リンクを即時無効化する（キルスイッチ）
+          </button>
+        </form>
+        """
+    else:
+        action_btn = f"""
+        <form method="POST" action="/share/{token}/api/unrevoke" onsubmit="return confirm('共有リンクのアクセスを再開しますか？');">
+          <input type="hidden" name="key" value="{html.escape(key)}">
+          <button type="submit" style="background:#059669; color:#fff; border:none; padding:12px 28px; border-radius:8px; font-weight:bold; font-size:14px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; box-shadow:0 4px 12px rgba(5,150,105,0.3);">
+            <span>🔄</span> 共有リンクを再有効化する
+          </button>
+        </form>
+        """
+
+    msg_html = f'<div style="background:rgba(16,185,129,0.2); border:1px solid #10b981; color:#6ee7b7; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(message)}</div>' if message else ""
+    err_html = f'<div style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(error)}</div>' if error else ""
+
+    admin_link = '<div style="margin-top:20px; text-align:center;"><a href="/admin" style="color:#38bdf8; font-size:13px; text-decoration:none;">⬅ 管理ダッシュボードに戻る</a></div>' if is_admin else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>共有リンク管理 - OmusuBI Secure Share</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #0b0f19; color: #f8fafc; margin: 0; padding: 30px 20px; }}
+    .container {{ max-width: 800px; margin: 0 auto; }}
+    .header {{ display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 24px; }}
+    .card {{ background: #161e2e; border: 1px solid #334155; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }}
+    .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 20px; }}
+    .kpi-box {{ background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; text-align: center; }}
+    .kpi-title {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }}
+    .kpi-val {{ font-size: 20px; font-weight: bold; color: #38bdf8; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <span style="font-size:26px;">🛡️</span>
+        <div>
+          <h1 style="font-size:18px; margin:0; font-weight:700;">OmusuBI ファイル共有管理ポータル</h1>
+          <div style="font-size:12px; color:#94a3b8;">Active! gate 準拠 送信者リンク管理 & キルスイッチ</div>
+        </div>
+      </div>
+      <div>{status_badge}</div>
+    </div>
+
+    {msg_html}
+    {err_html}
+
+    <div class="card">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+        <h2 style="font-size:16px; margin:0; color:#f1f5f9;">📋 共有リンク詳細</h2>
+        <span style="font-family:monospace; font-size:12px; color:#64748b;">Token: {token}</span>
+      </div>
+
+      <div class="info-grid">
+        <div class="kpi-box"><div class="kpi-title">件名</div><div style="font-size:14px; font-weight:bold; color:#f1f5f9; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{subject}">{subject}</div></div>
+        <div class="kpi-box"><div class="kpi-title">送信元</div><div style="font-size:13px; font-weight:bold; color:#cbd5e1;">{mail_from}</div></div>
+        <div class="kpi-box"><div class="kpi-title">ファイル数 / 合計</div><div class="kpi-val">{len(files)} 件 / {total_size}</div></div>
+        <div class="kpi-box"><div class="kpi-title">累計ダウンロード数</div><div class="kpi-val" style="color:#10b981;">{dl_count} 回</div></div>
+      </div>
+
+      <div style="background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:14px 18px; margin-bottom:20px; font-size:13px;">
+        <div style="margin-bottom:6px;"><strong style="color:#94a3b8;">作成日時:</strong> {created_str}</div>
+        <div style="margin-bottom:6px;"><strong style="color:#94a3b8;">有効期限:</strong> {expire_days} 日間（失効後は自動削除）</div>
+        <div>
+          <strong style="color:#94a3b8;">受取人共有URL:</strong> 
+          <a href="{share_url}" target="_blank" style="color:#38bdf8; text-decoration:underline; word-break:break-all;">{share_url}</a>
+        </div>
+      </div>
+
+      <div style="margin-bottom:24px;">
+        <h3 style="font-size:14px; color:#cbd5e1; margin:0 0 10px 0;">📎 添付ファイル一覧</h3>
+        <table style="width:100%; border-collapse:collapse; background:#0f172a; border:1px solid #1e293b; border-radius:8px; overflow:hidden;">
+          <thead>
+            <tr style="background:#1e293b; text-align:left;">
+              <th style="padding:10px 14px; font-size:12px; color:#94a3b8;">ファイル名</th>
+              <th style="padding:10px 14px; font-size:12px; color:#94a3b8; text-align:right;">サイズ</th>
+            </tr>
+          </thead>
+          <tbody>
+            {file_rows}
+          </tbody>
+        </table>
+      </div>
+
+      <div style="border-top:1px solid #334155; padding-top:20px; text-align:center;">
+        {action_btn}
+        <div style="margin-top:10px; font-size:12px; color:#94a3b8;">
+          ※ 無効化ボタンを押すと、受取人側のアクセスは即時に遮断されます。
+        </div>
+      </div>
+    </div>
+    {admin_link}
+  </div>
+</body>
+</html>"""
+
+def render_approval_page(pending_info: dict, approve_token: str, error: str = "") -> str:
+    """上長承認・誤送信防止ポータル画面"""
+    subject = html.escape(pending_info.get("subject") or "無題")
+    mail_from = html.escape(pending_info.get("mail_from") or "")
+    rcpt_tos = pending_info.get("rcpt_tos", [])
+    rcpt_str = html.escape(", ".join(rcpt_tos))
+    body_preview = html.escape(pending_info.get("body_preview") or "（プレビューなし）")
+    attachments = pending_info.get("attachments", [])
+    
+    status = pending_info.get("status", "pending")
+    created_at = pending_info.get("created_at", "")
+    created_str = datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M:%S") if created_at else ""
+    
+    expires_at = pending_info.get("expires_at", 0)
+    remain_secs = max(0, int(expires_at - time.time()))
+
+    attach_rows = ""
+    for a in attachments:
+        fname = html.escape(a.get("filename", "attachment"))
+        fsize = format_size(a.get("size", 0))
+        attach_rows += f'<li style="margin-bottom:4px; color:#e2e8f0;">📄 <strong>{fname}</strong> ({fsize})</li>'
+    if not attach_rows:
+        attach_rows = '<li style="color:#64748b;">添付ファイルなし</li>'
+
+    err_html = f'<div style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(error)}</div>' if error else ""
+
+    if status != "pending":
+        status_text = "承認済み（配送完了）" if status == "approved" else ("却下（差し戻し済み）" if status == "rejected" else "送信者により取り消し済み")
+        status_color = "#10b981" if status == "approved" else "#ef4444"
+        return f"""<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>承認処理完了 - OmusuBI</title>
+<style>body {{ font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; background:#0b0f19; color:#f8fafc; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; }}
+.card {{ background:#161e2e; border:1px solid #334155; border-radius:12px; padding:36px; max-width:500px; width:100%; text-align:center; }}</style></head>
+<body>
+  <div class="card">
+    <div style="font-size:48px; margin-bottom:16px;">ℹ️</div>
+    <h2 style="font-size:20px; margin:0 0 12px 0;">このメールは処理済みです</h2>
+    <p style="font-size:14px; color:#94a3b8; margin-bottom:16px;">ステータス: <strong style="color:{status_color};">{status_text}</strong></p>
+    <div style="background:#0f172a; padding:12px; border-radius:8px; font-size:13px; text-align:left; color:#cbd5e1;">
+      <div><strong>件名:</strong> {subject}</div>
+      <div style="margin-top:4px;"><strong>送信元:</strong> {mail_from}</div>
+    </div>
+  </div>
+</body></html>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>メール送信承認（上長承認）- OmusuBI 誤送信防止</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #0b0f19; color: #f8fafc; margin: 0; padding: 30px 20px; }}
+    .container {{ max-width: 760px; margin: 0 auto; }}
+    .card {{ background: #161e2e; border: 1px solid #334155; border-radius: 12px; padding: 28px; margin-bottom: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }}
+    .badge {{ display: inline-block; padding: 4px 12px; background: rgba(245,158,11,0.2); border: 1px solid #f59e0b; border-radius: 20px; color: #fcd34d; font-size: 12px; font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #1e293b; padding-bottom:16px; margin-bottom:24px;">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <span style="font-size:28px;">👔</span>
+        <div>
+          <h1 style="font-size:18px; margin:0; font-weight:700;">OmusuBI メール送信承認ポータル</h1>
+          <div style="font-size:12px; color:#94a3b8;">Active! gate 準拠 上長承認（誤送信・情報漏洩防止）</div>
+        </div>
+      </div>
+      <div><span class="badge">⏳ 承認待ち（残り {remain_secs} 秒）</span></div>
+    </div>
+
+    {err_html}
+
+    <div class="card">
+      <h2 style="font-size:16px; margin:0 0 16px 0; color:#f1f5f9;">📧 送信保留メール詳細</h2>
+      <div style="background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:16px; margin-bottom:20px; font-size:13px;">
+        <div style="margin-bottom:8px;"><strong style="color:#94a3b8; width:80px; display:inline-block;">件名:</strong> <span style="font-weight:bold; color:#f1f5f9;">{subject}</span></div>
+        <div style="margin-bottom:8px;"><strong style="color:#94a3b8; width:80px; display:inline-block;">送信者:</strong> <span>{mail_from}</span></div>
+        <div style="margin-bottom:8px;"><strong style="color:#94a3b8; width:80px; display:inline-block;">宛先:</strong> <span style="color:#38bdf8;">{rcpt_str}</span></div>
+        <div><strong style="color:#94a3b8; width:80px; display:inline-block;">送信時刻:</strong> <span>{created_str}</span></div>
+      </div>
+
+      <div style="margin-bottom:20px;">
+        <div style="font-size:13px; font-weight:bold; color:#94a3b8; margin-bottom:6px;">📎 添付ファイル ({len(attachments)} 件):</div>
+        <ul style="margin:0; padding-left:20px; background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:12px 28px; font-size:13px;">
+          {attach_rows}
+        </ul>
+      </div>
+
+      <div style="margin-bottom:24px;">
+        <div style="font-size:13px; font-weight:bold; color:#94a3b8; margin-bottom:6px;">📝 本文プレビュー:</div>
+        <div style="background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:14px; font-size:13px; color:#cbd5e1; max-height:200px; overflow-y:auto; white-space:pre-wrap; line-height:1.5;">{body_preview}</div>
+      </div>
+
+      <div style="border-top:1px solid #334155; padding-top:20px;">
+        <div style="display:flex; gap:16px; justify-content:center; flex-wrap:wrap;">
+          <form method="POST" action="/outbound/approve/{approve_token}/action">
+            <input type="hidden" name="action" value="approve">
+            <button type="submit" style="background:#059669; color:#fff; border:none; padding:12px 32px; border-radius:8px; font-weight:bold; font-size:15px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; box-shadow:0 4px 12px rgba(5,150,105,0.4);">
+              <span>✅</span> 送信を承認する（直ちに宛先へ配送）
+            </button>
+          </form>
+
+          <form method="POST" action="/outbound/approve/{approve_token}/action" onsubmit="return confirm('このメールの送信を却下（差し戻し）しますか？\\n相手先へは配送されず、送信者に差し戻されます。');" style="display:flex; gap:8px;">
+            <input type="hidden" name="action" value="reject">
+            <input type="text" name="reason" placeholder="却下・差し戻し理由（任意）" style="background:#0f172a; border:1px solid #475569; color:#f8fafc; padding:10px 12px; border-radius:6px; font-size:13px; width:220px;">
+            <button type="submit" style="background:#dc2626; color:#fff; border:none; padding:12px 24px; border-radius:8px; font-weight:bold; font-size:14px; cursor:pointer; display:inline-flex; align-items:center; gap:6px;">
+              <span>❌</span> 却下する
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+def render_admin_login(error: str = "") -> str:
+    """管理者ログイン画面"""
+    err_html = f'<div style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:10px 14px; border-radius:6px; margin-bottom:16px; font-size:13px;">{html.escape(error)}</div>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理者ログイン - OmusuBI Secure Share</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #0b0f19; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
+    .card {{ background: #161e2e; border: 1px solid #334155; border-radius: 12px; padding: 36px 30px; max-width: 400px; width: 100%; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }}
+    input[type=password] {{ width: 100%; box-sizing: border-box; background: #0f172a; border: 1px solid #475569; border-radius: 6px; padding: 12px 14px; color: #fff; font-size: 14px; margin-bottom: 16px; }}
+    input[type=password]:focus {{ outline: none; border-color: #38bdf8; ring: 2px #38bdf8; }}
+    button {{ width: 100%; background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 12px; font-size: 15px; font-weight: bold; cursor: pointer; }}
+    button:hover {{ background: #1d4ed8; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="text-align:center; margin-bottom:24px;">
+      <div style="font-size:42px; margin-bottom:8px;">🔒</div>
+      <h1 style="font-size:18px; margin:0; font-weight:bold;">OmusuBI 管理者ポータル</h1>
+      <div style="font-size:12px; color:#94a3b8; margin-top:4px;">Secure Share & 誤送信防止統合管理</div>
+    </div>
+    {err_html}
+    <form method="POST" action="/admin/login">
+      <div style="margin-bottom:16px;">
+        <label style="display:block; font-size:12px; color:#cbd5e1; margin-bottom:6px; font-weight:600;">管理者パスワード</label>
+        <input type="password" name="password" required autofocus placeholder="管理者パスワードを入力">
+      </div>
+      <button type="submit">ログイン</button>
+    </form>
+    <div style="margin-top:20px; text-align:center; font-size:11px; color:#64748b;">
+      ※ セッションは安全にHMAC署名され8時間有効です
+    </div>
+  </div>
+</body>
+</html>"""
+
+def render_admin_dashboard(shares: list, pending_mails: list, message: str = "", error: str = "") -> str:
+    """管理者統合ダッシュボード（Active! gate SS 準拠 管理画面）"""
+    total_shares = len(shares)
+    active_shares = sum(1 for s in shares if s.get("status") != "revoked" and not s.get("is_expired"))
+    revoked_shares = sum(1 for s in shares if s.get("status") == "revoked")
+    pending_count = len(pending_mails)
+    total_dl = sum(s.get("download_count", 0) for s in shares)
+
+    share_rows = ""
+    for s in shares:
+        tok = s.get("token", "")
+        subj = html.escape(s.get("subject") or "無題")
+        mail_from = html.escape(s.get("mail_from") or "")
+        f_count = s.get("file_count", 0)
+        size_str = format_size(s.get("total_size", 0))
+        created = s.get("created_at", "")[:16].replace("T", " ")
+        dl = s.get("download_count", 0)
+        mgmt_key = s.get("mgmt_key", "")
+        
+        is_rev = s.get("status") == "revoked"
+        is_exp = s.get("is_expired", False)
+        
+        if is_rev:
+            status_badge = '<span style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:3px 8px; border-radius:12px; font-size:11px; font-weight:bold;">🛑 無効化</span>'
+            toggle_btn = '<form method="POST" action="/admin/api/action" style="display:inline;"><input type="hidden" name="action" value="unrevoke"><input type="hidden" name="token" value="' + tok + '"><button type="submit" style="background:#059669; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">再有効化</button></form>'
+        elif is_exp:
+            status_badge = '<span style="background:rgba(100,116,139,0.2); border:1px solid #64748b; color:#cbd5e1; padding:3px 8px; border-radius:12px; font-size:11px; font-weight:bold;">⌛ 期限切れ</span>'
+            toggle_btn = '<span style="color:#64748b; font-size:11px;">-</span>'
+        else:
+            status_badge = '<span style="background:rgba(16,185,129,0.2); border:1px solid #10b981; color:#6ee7b7; padding:3px 8px; border-radius:12px; font-size:11px; font-weight:bold;">🟢 有効</span>'
+            toggle_btn = f'''<form method="POST" action="/admin/api/action" onsubmit="return confirm(&quot;トークン {tok} を即時無効化しますか？&quot;);" style="display:inline;"><input type="hidden" name="action" value="revoke"><input type="hidden" name="token" value="{tok}"><button type="submit" style="background:#dc2626; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">即時無効化</button></form>'''
+
+        manage_link = f"/share/{tok}/manage?key={urllib.parse.quote(mgmt_key)}" if mgmt_key else f"/share/{tok}"
+        share_rows += f"""
+        <tr>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-family:monospace; font-size:12px; color:#38bdf8;">
+            <a href="{manage_link}" target="_blank" style="color:#38bdf8; text-decoration:none;">{tok[:12]}...</a>
+          </td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:13px; color:#f1f5f9; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{subj}">{subj}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1;">{mail_from}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1; text-align:center;">{f_count}件 ({size_str})</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#94a3b8;">{created}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#10b981; font-weight:bold; text-align:center;">{dl}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; text-align:center;">{status_badge}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; text-align:center;">
+            {toggle_btn}
+            <a href="/share/{tok}" target="_blank" style="margin-left:6px; color:#94a3b8; font-size:11px; text-decoration:none;">受信者View</a>
+          </td>
+        </tr>
+        """
+    if not share_rows:
+        share_rows = '<tr><td colspan="8" style="padding:24px; text-align:center; color:#64748b;">発行済みの共有リンクはありません</td></tr>'
+
+    pending_rows = ""
+    for p in pending_mails:
+        a_tok = p.get("approve_token", "")
+        subj = html.escape(p.get("subject") or "無題")
+        mail_from = html.escape(p.get("mail_from") or "")
+        rcpts = html.escape(", ".join(p.get("rcpt_tos", [])))
+        att_c = len(p.get("attachments", []))
+        rem = max(0, int(p.get("expires_at", 0) - time.time()))
+        
+        pending_rows += f"""
+        <tr>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:13px; color:#f1f5f9; font-weight:bold;">{subj}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1;">{mail_from}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#38bdf8; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{rcpts}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1; text-align:center;">{att_c} 件</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#f59e0b; font-weight:bold; text-align:center;">残り {rem}秒</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; text-align:center;">
+            <form method="POST" action="/outbound/approve/{a_tok}/action" style="display:inline;">
+              <input type="hidden" name="action" value="approve">
+              <button type="submit" style="background:#059669; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:bold;">✅ 承認</button>
+            </form>
+            <form method="POST" action="/outbound/approve/{a_tok}/action" onsubmit="return confirm('このメール送信を取り消しますか？');" style="display:inline; margin-left:4px;">
+              <input type="hidden" name="action" value="reject">
+              <input type="hidden" name="reason" value="管理者による保留取り消し">
+              <button type="submit" style="background:#dc2626; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:bold;">🛑 取消</button>
+            </form>
+            <a href="/outbound/approve/{a_tok}" target="_blank" style="margin-left:6px; color:#38bdf8; font-size:11px; text-decoration:none;">詳細</a>
+          </td>
+        </tr>
+        """
+    if not pending_rows:
+        pending_rows = '<tr><td colspan="6" style="padding:20px; text-align:center; color:#64748b;">現在保留中・承認待ちのメールはありません</td></tr>'
+
+    msg_html = f'<div style="background:rgba(16,185,129,0.2); border:1px solid #10b981; color:#6ee7b7; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(message)}</div>' if message else ""
+    err_html = f'<div style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(error)}</div>' if error else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmusuBI Secure Share - 統合管理ポータル</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #0b0f19; color: #f8fafc; margin: 0; padding: 24px; }}
+    .container {{ max-width: 1200px; margin: 0 auto; }}
+    .header {{ display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 24px; }}
+    .kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 28px; }}
+    .kpi-card {{ background: #161e2e; border: 1px solid #1e293b; border-radius: 10px; padding: 18px 20px; text-align: left; }}
+    .kpi-label {{ font-size: 12px; color: #94a3b8; font-weight: 600; margin-bottom: 6px; text-transform: uppercase; }}
+    .kpi-num {{ font-size: 26px; font-weight: 800; color: #f8fafc; }}
+    .card {{ background: #161e2e; border: 1px solid #334155; border-radius: 12px; padding: 24px; margin-bottom: 28px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }}
+    table {{ width: 100%; border-collapse: collapse; background: #0f172a; border-radius: 8px; overflow: hidden; }}
+    th {{ background: #1e293b; padding: 10px 12px; font-size: 12px; color: #94a3b8; font-weight: 600; text-align: left; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <span style="font-size:32px;">🎛️</span>
+        <div>
+          <h1 style="font-size:20px; margin:0; font-weight:bold;">OmusuBI Secure Share 統合管理ダッシュボード</h1>
+          <div style="font-size:12px; color:#94a3b8;">Active! gate SS 準拠 送信保留・上長承認・リンク即時無効化（キルスイッチ）一元管理</div>
+        </div>
+      </div>
+      <div>
+        <a href="/admin/logout" style="background:#334155; color:#cbd5e1; text-decoration:none; padding:8px 16px; border-radius:6px; font-size:13px; font-weight:600;">ログアウト</a>
+      </div>
+    </div>
+
+    {msg_html}
+    {err_html}
+
+    <div class="kpi-row">
+      <div class="kpi-card">
+        <div class="kpi-label">🟢 有効共有リンク</div>
+        <div class="kpi-num" style="color:#10b981;">{active_shares} <span style="font-size:14px; font-weight:normal; color:#64748b;">/ {total_shares} 件</span></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">🛑 即時無効化リンク</div>
+        <div class="kpi-num" style="color:#ef4444;">{revoked_shares} <span style="font-size:14px; font-weight:normal; color:#64748b;">件</span></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">⏳ 保留・承認待ちメール</div>
+        <div class="kpi-num" style="color:#f59e0b;">{pending_count} <span style="font-size:14px; font-weight:normal; color:#64748b;">通</span></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">📥 累計ダウンロード</div>
+        <div class="kpi-num" style="color:#38bdf8;">{total_dl} <span style="font-size:14px; font-weight:normal; color:#64748b;">回</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+        <h2 style="font-size:16px; margin:0; color:#f1f5f9; display:flex; align-items:center; gap:8px;">
+          <span>⏳</span> 送信保留・上長承認キュー ({pending_count} 件)
+        </h2>
+        <span style="font-size:12px; color:#94a3b8;">80秒保留待機中または上長承認待ちの社外宛てメール</span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>件名</th>
+              <th>送信元</th>
+              <th>宛先</th>
+              <th style="text-align:center;">添付</th>
+              <th style="text-align:center;">保留状態</th>
+              <th style="text-align:center;">アクション</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pending_rows}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+        <h2 style="font-size:16px; margin:0; color:#f1f5f9; display:flex; align-items:center; gap:8px;">
+          <span>📁</span> 発行済み共有リンク管理 ({total_shares} 件)
+        </h2>
+        <span style="font-size:12px; color:#94a3b8;">暗号化保管中のファイル共有リンク & キルスイッチ操作</span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>トークン</th>
+              <th>件名</th>
+              <th>送信元</th>
+              <th style="text-align:center;">ファイル / 容量</th>
+              <th>作成日時</th>
+              <th style="text-align:center;">DL数</th>
+              <th style="text-align:center;">ステータス</th>
+              <th style="text-align:center;">アクション</th>
+            </tr>
+          </thead>
+          <tbody>
+            {share_rows}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
 async def handle_share_page(request: web.Request):
     token = request.match_info.get("token")
     meta = get_normalized_metadata(token)
     if not meta:
         return web.Response(text="共有ファイルが見つかりません。", status=404, content_type="text/html")
+        
+    if is_share_revoked(meta):
+        html = render_revoked_page(meta)
+        return web.Response(text=html, status=403, content_type="text/html")
         
     kek = get_master_key()
     session_cookie = request.cookies.get("secure_share_session")
@@ -1461,6 +2098,10 @@ async def handle_request_otp(request: web.Request):
     meta = get_normalized_metadata(token)
     if not meta:
         return web.Response(text="共有ファイルが見つかりません。", status=404, content_type="text/html")
+        
+    if is_share_revoked(meta):
+        html = render_revoked_page(meta)
+        return web.Response(text=html, status=403, content_type="text/html")
         
     if is_share_expired(meta):
         html = render_page(token, meta)
@@ -1601,8 +2242,15 @@ async def handle_download_file(request: web.Request):
     if not meta:
         return web.Response(text="共有ファイルが見つかりません。", status=404)
         
+    if is_share_revoked(meta):
+        return web.Response(text="この共有リンクは無効化（アクセス停止）されています。", status=403)
+        
     if is_share_expired(meta):
         return web.Response(text="共有有効期限が切れています。", status=410)
+
+    # ダウンロードカウント加算 & 監査ログ
+    meta["download_count"] = meta.get("download_count", 0) + 1
+    log_audit_event(meta, token, "download", f"Downloaded file_id={file_id}", request.remote or "")
         
     kek = get_master_key()
     session_cookie = request.cookies.get("secure_share_session")
@@ -2269,6 +2917,9 @@ async def handle_download_all(request: web.Request):
     if not meta:
         return web.Response(text="共有ファイルが見つかりません。", status=404)
         
+    if is_share_revoked(meta):
+        return web.Response(text="この共有リンクは無効化（アクセス停止）されています。", status=403)
+        
     if is_share_expired(meta):
         return web.Response(text="共有有効期限が切れています。", status=410)
         
@@ -2278,6 +2929,10 @@ async def handle_download_all(request: web.Request):
     
     if not auth_email_hash or auth_email_hash not in meta.get("recipients_hashes", []):
         return web.HTTPFound(f"/share/{token}")
+
+    # ダウンロードカウント加算 & 監査ログ
+    meta["download_count"] = meta.get("download_count", 0) + 1
+    log_audit_event(meta, token, "download_all", f"Bulk ZIP downloaded ({len(files)} files)", request.remote or "")
 
     files = meta.get("files", [])
     if not files:
@@ -2377,6 +3032,261 @@ async def handle_cancel_outbound(request: web.Request):
         html = render_cancel_page(status="error")
         return web.Response(text=html, content_type="text/html")
 
+
+async def handle_manage_share(request: web.Request):
+    """送信者・管理者向け 共有リンク管理画面"""
+    token = request.match_info.get("token")
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.Response(text="共有ファイルが見つかりません。", status=404)
+        
+    kek = get_master_key()
+    key = request.query.get("key", "")
+    admin_cookie = request.cookies.get("secure_share_admin_session")
+    is_admin = verify_admin_session(admin_cookie, kek)
+    
+    mgmt_key = meta.get("mgmt_key", "")
+    is_authorized = is_admin or (key and mgmt_key and hmac.compare_digest(key, mgmt_key))
+    
+    if not is_authorized:
+        return web.Response(text="管理画面へのアクセス権限がありません（無効な管理キーです）。", status=403)
+        
+    msg = request.query.get("msg", "")
+    html = render_manage_page(token, meta, key=key or mgmt_key, is_admin=is_admin, message=msg)
+    return web.Response(text=html, content_type="text/html")
+
+async def handle_api_revoke(request: web.Request):
+    """共有リンクの即時無効化（キルスイッチ）"""
+    token = request.match_info.get("token")
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.Response(text="共有ファイルが見つかりません。", status=404)
+        
+    kek = get_master_key()
+    post_data = await request.post() if request.method == "POST" else {}
+    key = post_data.get("key") or request.query.get("key", "")
+    admin_cookie = request.cookies.get("secure_share_admin_session")
+    is_admin = verify_admin_session(admin_cookie, kek)
+    
+    mgmt_key = meta.get("mgmt_key", "")
+    is_authorized = is_admin or (key and mgmt_key and hmac.compare_digest(key, mgmt_key))
+    if not is_authorized:
+        return web.Response(text="権限がありません。", status=403)
+        
+    meta["status"] = "revoked"
+    meta["revoked_at"] = datetime.now().isoformat()
+    meta["revoked_by"] = "admin" if is_admin else "sender"
+    log_audit_event(meta, token, "revoke", f"Revoked by {meta['revoked_by']}", request.remote or "")
+    
+    redirect_url = f"/share/{token}/manage?key={urllib.parse.quote(key or mgmt_key)}&msg=共有リンクを即時無効化しました（アクセス遮断中）"
+    return web.HTTPFound(redirect_url)
+
+async def handle_api_unrevoke(request: web.Request):
+    """共有リンクの再有効化"""
+    token = request.match_info.get("token")
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.Response(text="共有ファイルが見つかりません。", status=404)
+        
+    kek = get_master_key()
+    post_data = await request.post() if request.method == "POST" else {}
+    key = post_data.get("key") or request.query.get("key", "")
+    admin_cookie = request.cookies.get("secure_share_admin_session")
+    is_admin = verify_admin_session(admin_cookie, kek)
+    
+    mgmt_key = meta.get("mgmt_key", "")
+    is_authorized = is_admin or (key and mgmt_key and hmac.compare_digest(key, mgmt_key))
+    if not is_authorized:
+        return web.Response(text="権限がありません。", status=403)
+        
+    meta["status"] = "active"
+    meta["unrevoked_at"] = datetime.now().isoformat()
+    log_audit_event(meta, token, "unrevoke", f"Unrevoked by {'admin' if is_admin else 'sender'}", request.remote or "")
+    
+    redirect_url = f"/share/{token}/manage?key={urllib.parse.quote(key or mgmt_key)}&msg=共有リンクを再有効化しました"
+    return web.HTTPFound(redirect_url)
+
+async def handle_approve_page(request: web.Request):
+    """上長承認ポータル画面"""
+    approve_token = request.match_info.get("approve_token")
+    if not approve_token:
+        return web.Response(text="承認トークンが指定されていません。", status=400)
+        
+    pending_info = None
+    if os.path.exists(PENDING_DIR):
+        for fname in os.listdir(PENDING_DIR):
+            if fname.endswith(".json"):
+                fpath = os.path.join(PENDING_DIR, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if data.get("approve_token") == approve_token:
+                            pending_info = data
+                            break
+                except Exception:
+                    pass
+                    
+    if not pending_info:
+        html = render_cancel_page(status="not_found")
+        return web.Response(text=html, content_type="text/html")
+        
+    html = render_approval_page(pending_info, approve_token)
+    return web.Response(text=html, content_type="text/html")
+
+async def handle_approve_action(request: web.Request):
+    """上長承認アクション（承認または却下）"""
+    approve_token = request.match_info.get("approve_token")
+    data = await request.post()
+    action = data.get("action", "")
+    reason = data.get("reason", "").strip()
+    
+    target_file = None
+    target_data = None
+    if os.path.exists(PENDING_DIR):
+        for fname in os.listdir(PENDING_DIR):
+            if fname.endswith(".json"):
+                fpath = os.path.join(PENDING_DIR, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        pdata = json.load(f)
+                        if pdata.get("approve_token") == approve_token:
+                            target_file = fpath
+                            target_data = pdata
+                            break
+                except Exception:
+                    pass
+                    
+    if not target_file or not target_data:
+        html = render_cancel_page(status="not_found")
+        return web.Response(text=html, content_type="text/html")
+        
+    if action == "approve":
+        target_data["status"] = "approved"
+        target_data["approved_at"] = datetime.now().isoformat()
+        with open(target_file, "w", encoding="utf-8") as f:
+            json.dump(target_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Outbound mail APPROVED by approver: approve_token={approve_token}")
+        html = render_approval_page(target_data, approve_token)
+        return web.Response(text=html, content_type="text/html")
+    elif action == "reject":
+        target_data["status"] = "rejected"
+        target_data["rejected_at"] = datetime.now().isoformat()
+        target_data["reject_reason"] = reason or "上長により却下されました"
+        with open(target_file, "w", encoding="utf-8") as f:
+            json.dump(target_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Outbound mail REJECTED by approver: approve_token={approve_token}, reason='{reason}'")
+        html = render_approval_page(target_data, approve_token)
+        return web.Response(text=html, content_type="text/html")
+    else:
+        return web.Response(text="不正なアクションです。", status=400)
+
+async def handle_admin_login(request: web.Request):
+    """管理者ログイン"""
+    kek = get_master_key()
+    if request.method == "POST":
+        data = await request.post()
+        pwd = data.get("password", "")
+        if pwd and hmac.compare_digest(pwd, ADMIN_PASSWORD):
+            session_val = create_admin_session(kek)
+            resp = web.HTTPFound("/admin")
+            resp.set_cookie(
+                "secure_share_admin_session",
+                session_val,
+                max_age=ADMIN_SESSION_EXPIRY,
+                httponly=True,
+                secure=True,
+                samesite="Lax"
+            )
+            logger.info("Admin logged in successfully.")
+            return resp
+        else:
+            logger.warning("Admin login failed: invalid password.")
+            return web.Response(text=render_admin_login(error="パスワードが正しくありません。"), content_type="text/html", status=401)
+            
+    admin_cookie = request.cookies.get("secure_share_admin_session")
+    if verify_admin_session(admin_cookie, kek):
+        return web.HTTPFound("/admin")
+    return web.Response(text=render_admin_login(), content_type="text/html")
+
+async def handle_admin_logout(request: web.Request):
+    resp = web.HTTPFound("/admin/login")
+    resp.del_cookie("secure_share_admin_session")
+    return resp
+
+async def handle_admin_dashboard(request: web.Request):
+    """管理者ダッシュボード"""
+    kek = get_master_key()
+    admin_cookie = request.cookies.get("secure_share_admin_session")
+    if not verify_admin_session(admin_cookie, kek):
+        return web.HTTPFound("/admin/login")
+        
+    shares = []
+    if os.path.exists(STORAGE_DIR):
+        for fname in os.listdir(STORAGE_DIR):
+            if fname.endswith(".meta") and not fname.startswith("test_"):
+                tok = fname[:-5]
+                meta = get_normalized_metadata(tok)
+                if meta:
+                    shares.append({
+                        "token": tok,
+                        "subject": meta.get("subject", ""),
+                        "mail_from": meta.get("mail_from", ""),
+                        "file_count": len(meta.get("files", [])),
+                        "total_size": meta.get("total_size", 0),
+                        "created_at": meta.get("created_at", ""),
+                        "download_count": meta.get("download_count", 0),
+                        "status": meta.get("status", "active"),
+                        "mgmt_key": meta.get("mgmt_key", ""),
+                        "is_expired": is_share_expired(meta)
+                    })
+    shares.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+
+    pending_mails = []
+    if os.path.exists(PENDING_DIR):
+        for fname in os.listdir(PENDING_DIR):
+            if fname.endswith(".json"):
+                fpath = os.path.join(PENDING_DIR, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        pdata = json.load(f)
+                        if pdata.get("status") == "pending":
+                            pending_mails.append(pdata)
+                except Exception:
+                    pass
+    pending_mails.sort(key=lambda p: p.get("created_at", ""), reverse=True)
+
+    msg = request.query.get("msg", "")
+    html = render_admin_dashboard(shares, pending_mails, message=msg)
+    return web.Response(text=html, content_type="text/html")
+
+async def handle_admin_action(request: web.Request):
+    """ダッシュボードからの管理者クイックアクション"""
+    kek = get_master_key()
+    admin_cookie = request.cookies.get("secure_share_admin_session")
+    if not verify_admin_session(admin_cookie, kek):
+        return web.HTTPFound("/admin/login")
+        
+    data = await request.post()
+    action = data.get("action", "")
+    token = data.get("token", "")
+    
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.HTTPFound("/admin?error=共有リンクが見つかりません")
+        
+    if action == "revoke":
+        meta["status"] = "revoked"
+        meta["revoked_at"] = datetime.now().isoformat()
+        meta["revoked_by"] = "admin"
+        log_audit_event(meta, token, "revoke", "Admin quick revoked", request.remote or "")
+        return web.HTTPFound(f"/admin?msg=トークン {token} を即時無効化しました")
+    elif action == "unrevoke":
+        meta["status"] = "active"
+        log_audit_event(meta, token, "unrevoke", "Admin quick unrevoked", request.remote or "")
+        return web.HTTPFound(f"/admin?msg=トークン {token} を再有効化しました")
+        
+    return web.HTTPFound("/admin")
+
 def init_app():
     app = web.Application()
     # 共有ポータル
@@ -2393,8 +3303,23 @@ def init_app():
     app.router.add_get("/share/{token}/file/{file_id}/zip-file/{entry_id}", handle_zip_file_entry)
     app.router.add_get("/share/{token}/api/content", handle_content_file)  # 後方互換
     
-    # Active! gate 準拠 送信一時保留取り消し
+    # Active! gate 準拠 送信一時保留取り消し & 上長承認
     app.router.add_get("/outbound/cancel/{cancel_token}", handle_cancel_outbound)
+    app.router.add_get("/outbound/approve/{approve_token}", handle_approve_page)
+    app.router.add_post("/outbound/approve/{approve_token}/action", handle_approve_action)
+
+    # 送信者用個別管理画面 & キルスイッチAPI
+    app.router.add_get("/share/{token}/manage", handle_manage_share)
+    app.router.add_post("/share/{token}/api/revoke", handle_api_revoke)
+    app.router.add_post("/share/{token}/api/unrevoke", handle_api_unrevoke)
+
+    # 統合管理ダッシュボード
+    app.router.add_get("/admin", handle_admin_dashboard)
+    app.router.add_get("/manage", lambda req: web.HTTPFound("/admin"))
+    app.router.add_get("/admin/login", handle_admin_login)
+    app.router.add_post("/admin/login", handle_admin_login)
+    app.router.add_get("/admin/logout", handle_admin_logout)
+    app.router.add_post("/admin/api/action", handle_admin_action)
     return app
 
 if __name__ == "__main__":
