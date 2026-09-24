@@ -42,10 +42,10 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # === 設定 ===
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 10029
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://share.example.com")
-STORAGE_DIR = os.environ.get("STORAGE_DIR", "/srv/secure-shares")
+PUBLIC_BASE_URL = "https://fs.nigiri-rice.com"
+STORAGE_DIR = "/srv/secure-shares"
 PENDING_DIR = "/srv/secure-shares/pending"
-KEY_PATH = os.environ.get("KEY_PATH", "/etc/mailcow-secure-share/master.key")
+KEY_PATH = "/etc/mailcow-secure-share/master.key"
 LOG_PATH = "/var/log/mailcow-secure-share/gateway.log"
 
 CHUNK_SIZE = 64 * 1024  # 64 KB
@@ -441,7 +441,7 @@ def send_otp_email(to_addr: str, otp_code: str, title: str, file_count: int = 1)
     html_body = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #1f2937; padding: 20px;">
+<body style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #1f2937; padding: 20px;">
   <div style="max-width: 540px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 28px;">
     <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 20px; border-bottom: 2px solid #2563eb; padding-bottom: 12px;">
       <span style="font-size: 24px;">🔒</span>
@@ -499,7 +499,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>リンク期限切れ - OmusuBI 安全ファイル共有</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f4f6; color: #1f2937; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #f3f4f6; color: #1f2937; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }}
     .card {{ background: #fff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); max-width: 480px; width: 100%; padding: 32px; text-align: center; }}
     .icon {{ font-size: 48px; margin-bottom: 16px; }}
     h1 {{ font-size: 20px; color: #dc2626; margin: 0 0 12px; }}
@@ -518,7 +518,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
     # スタイル定義
     style = """
     * { box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #f8fafc; color: #1e293b; margin: 0; padding: 0; min-height: 100vh; display: flex; flex-direction: column; }
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #f8fafc; color: #1e293b; margin: 0; padding: 0; min-height: 100vh; display: flex; flex-direction: column; }
     .header { background: #ffffff; border-bottom: 1px solid #e2e8f0; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
     .logo { display: flex; align-items: center; gap: 10px; font-weight: bold; font-size: 16px; color: #0f172a; }
     .container { flex: 1; max-width: 960px; width: 100%; margin: 32px auto; padding: 0 16px; }
@@ -877,7 +877,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
               .then(function(text) {{
                 var isTsv = filename.toLowerCase().endsWith('.tsv');
                 var delimiter = isTsv ? '	' : ',';
-                var lines = text.replace(new RegExp('\\r', 'g'), '').split('\n');
+                var lines = text.replace(new RegExp(String.fromCharCode(13), 'g'), '').split(String.fromCharCode(10));
                 if (lines.length === 0 || (lines.length === 1 && lines[0] === '')) {{
                   container.innerHTML = '<div style="padding:40px; text-align:center; color:#64748b;">データが空です</div>';
                   return;
@@ -923,7 +923,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
                     '</div>' +
                   '</div>' +
                   '<div style="max-height:600px; overflow:auto; border:1px solid #e2e8f0; border-radius:6px;">' +
-                    '<table id="' + tableId + '" style="width:100%; border-collapse:collapse; font-size:12px; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;">' +
+                    '<table id="' + tableId + '" style="width:100%; border-collapse:collapse; font-size:12px; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;">' +
                       '<thead style="position:sticky; top:0; background:#f1f5f9; z-index:10; box-shadow:0 1px 2px rgba(0,0,0,0.05);">' +
                         '<tr>' +
                           header.map(function(h) {{ return '<th style="padding:10px 12px; border-bottom:2px solid #cbd5e1; text-align:left; color:#334155; font-weight:600; white-space:nowrap;">' + escapeHtml(h) + '</th>'; }}).join('') +
@@ -968,7 +968,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
                 loadScriptAsync('https://cdn.jsdelivr.net/npm/marked/marked.min.js')
                   .then(function() {{
                     var html = marked.parse(text);
-                    container.innerHTML = '<div class="markdown-body" style="padding:28px 36px; background:#ffffff; color:#1e293b; border-radius:8px; line-height:1.6; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif; max-height:700px; overflow:auto; border:1px solid #e2e8f0;">' + html + '</div>';
+                    container.innerHTML = '<div class="markdown-body" style="padding:28px 36px; background:#ffffff; color:#1e293b; border-radius:8px; line-height:1.6; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; max-height:700px; overflow:auto; border:1px solid #e2e8f0;">' + html + '</div>';
                   }})
                   .catch(function() {{
                     container.innerHTML = '<pre style="padding:20px; background:#fff; font-family:monospace; font-size:13px; max-height:600px; overflow:auto;">' + escapeHtml(text) + '</pre>';
@@ -983,7 +983,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
             fetch(url)
               .then(function(res) {{ return res.text(); }})
               .then(function(text) {{
-                container.innerHTML = '<div style="background:#ffffff; border-radius:8px; padding:20px; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif; border:1px solid #e2e8f0;">' +
+                container.innerHTML = '<div style="background:#ffffff; border-radius:8px; padding:20px; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; border:1px solid #e2e8f0;">' +
                   '<div style="display:flex; align-items:center; gap:8px; margin-bottom:12px; padding-bottom:10px; border-bottom:1px solid #e2e8f0;">' +
                     '<span style="font-size:22px;">📐</span>' +
                     '<span style="font-weight:bold; font-size:14px; color:#1e293b;">LaTeX / TeX ドキュメントソース</span>' +
@@ -1354,7 +1354,7 @@ def render_cancel_page(status: str, mail_from: str = "", rcpt_tos: list = None, 
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title} - OmusuBI 誤送信防止システム</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #f8fafc; color: #1e293b; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }}
     .card {{ background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); max-width: 520px; width: 100%; padding: 36px 28px; text-align: center; }}
     .icon {{ font-size: 48px; margin-bottom: 16px; }}
     h1 {{ font-size: 20px; color: #0f172a; margin: 0 0 12px; }}
@@ -1654,7 +1654,7 @@ def generate_premiere_card(filename: str, file_path: str) -> str:
         media_badges += f'<span style="color: #64748b; font-size: 11px; margin-left: 6px;">他 {len(media_items) - 12} 件</span>'
 
     return f"""
-    <div style="background: #0f172a; color: #f8fafc; border-radius: 10px; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);">
+    <div style="background: #0f172a; color: #f8fafc; border-radius: 10px; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);">
       <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #334155; padding-bottom: 16px; margin-bottom: 20px;">
         <div style="display: flex; align-items: center; gap: 14px;">
           <div style="background: #581c87; color: #e9d5ff; width: 52px; height: 52px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 26px; border: 1px solid #7e22ce;">🎬</div>
@@ -1719,7 +1719,7 @@ def generate_aftereffects_card(filename: str, file_path: str) -> str:
         comp_items = '<div style="color: #64748b; font-size: 12px;">コンポジション情報解析中</div>'
 
     return f"""
-    <div style="background: #090d16; color: #f8fafc; border-radius: 10px; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);">
+    <div style="background: #090d16; color: #f8fafc; border-radius: 10px; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);">
       <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 20px;">
         <div style="display: flex; align-items: center; gap: 14px;">
           <div style="background: #1e1b4b; color: #a5b4fc; width: 52px; height: 52px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 26px; border: 1px solid #4338ca;">✨</div>
@@ -1763,7 +1763,7 @@ def generate_indesign_card(filename: str, file_path: str) -> str:
     font_badges = "".join([f'<span style="background: #f1f5f9; border: 1px solid #cbd5e1; padding: 3px 8px; border-radius: 4px; font-size: 11px; margin: 3px; display: inline-block;">🔤 {html.escape(f)}</span>' for f in fonts[:10]])
 
     return f"""
-    <div style="background: #ffffff; color: #0f172a; border-radius: 10px; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
+    <div style="background: #ffffff; color: #0f172a; border-radius: 10px; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
       <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e2e8f0; padding-bottom: 16px; margin-bottom: 20px;">
         <div style="display: flex; align-items: center; gap: 14px;">
           <div style="background: #fce7f3; color: #be185d; width: 52px; height: 52px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 26px; border: 1px solid #fbcfe8;">📰</div>
