@@ -56,6 +56,302 @@ SESSION_EXPIRY_SECONDS = 3600  # 1時間
 EXPIRE_DAYS = 60
 ADMIN_PASSWORD = os.environ.get("SECURE_SHARE_ADMIN_PASSWORD", "OmusuBI@Admin2026!")
 ADMIN_SESSION_EXPIRY = 28800  # 8時間
+CONFIG_PATH = "/etc/mailcow-secure-share/config.json"
+
+DEFAULT_CONFIG = {
+    "outbound_delay_seconds": 80,
+    "bcc_convert_threshold": 10,
+    "default_expire_days": 60,
+    "otp_expiry_minutes": 10,
+    "otp_max_attempts": 5,
+    "data_size_limit_gb": 0,
+    "default_theme": "system",
+    "sender_notification_address": "no-reply@mail.nigiri-rice.com",
+    "company_name": "OmusuBI (nigiri-rice.com)",
+    "bypass_subject_prefix": "-#-",
+    "admin_roles": ["admin", "iam-admin", "Developer", "su"]
+}
+
+OIDC_CONFIG_PATH = "/etc/mailcow-secure-share/oidc.json"
+
+DEFAULT_OIDC_CONFIG = {
+    "enabled": True,
+    "issuer": "https://sso.nigiri-rice.com/realms/master",
+    "internal_issuer": "http://10.43.148.25:8080/realms/master",
+    "client_id": "omusubi-secure-share",
+    "client_secret": "a6zbgbdCepBGkDzkgOCLFxpY8xTw8YxRXYs4SlmygHwHb2FCyf61TUeGfAFymAn2IgMBBWrvIeGiLGE4kTnCbV",
+    "redirect_uri": "https://fs.nigiri-rice.com/auth/callback",
+    "admin_roles": ["admin", "iam-admin", "Developer", "su"]
+}
+
+def get_oidc_config() -> dict:
+    cfg = DEFAULT_OIDC_CONFIG.copy()
+    if os.path.exists(OIDC_CONFIG_PATH):
+        try:
+            with open(OIDC_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            logger.warning(f"Failed to load OIDC config from {OIDC_CONFIG_PATH}: {e}")
+    sys_cfg = get_system_config()
+    if "admin_roles" in sys_cfg:
+        cfg["admin_roles"] = sys_cfg["admin_roles"]
+    return cfg
+
+def get_admin_password() -> str:
+    cfg = get_system_config()
+    return cfg.get("admin_password") or os.environ.get("SECURE_SHARE_ADMIN_PASSWORD", "OmusuBI@Admin2026!")
+
+SSO_SESSION_EXPIRY = 28800  # 8時間
+
+def create_sso_session(user_info: dict, kek: bytes) -> str:
+    ts = int(time.time())
+    exp = ts + SSO_SESSION_EXPIRY
+    payload = {
+        "sub": user_info.get("sub", ""),
+        "username": user_info.get("username", ""),
+        "email": user_info.get("email", ""),
+        "name": user_info.get("name") or user_info.get("username", ""),
+        "roles": user_info.get("roles", []),
+        "exp": exp,
+        "ts": ts
+    }
+    raw_json = json.dumps(payload, ensure_ascii=False)
+    sig = hmac.new(kek, raw_json.encode("utf-8"), hashlib.sha256).hexdigest()
+    encoded_payload = urllib.parse.quote(raw_json)
+    return f"{encoded_payload}.{sig}"
+
+def verify_sso_session(session_cookie: str, kek: bytes) -> dict | None:
+    if not session_cookie or "." not in session_cookie:
+        return None
+    try:
+        encoded_payload, sig = session_cookie.rsplit(".", 1)
+        raw_json = urllib.parse.unquote(encoded_payload)
+        expected_sig = hmac.new(kek, raw_json.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        payload = json.loads(raw_json)
+        if time.time() > payload.get("exp", 0):
+            return None
+        return payload
+    except Exception:
+        return None
+
+def get_current_sso_user(request: web.Request, kek: bytes) -> dict | None:
+    cookie = request.cookies.get("secure_share_sso_session")
+    return verify_sso_session(cookie, kek)
+
+def is_sso_admin(sso_user: dict | None) -> bool:
+    if not sso_user:
+        return False
+    user_roles = sso_user.get("roles", [])
+    sys_cfg = get_system_config()
+    allowed_roles = sys_cfg.get("admin_roles", ["admin", "iam-admin", "Developer", "su"])
+    if isinstance(allowed_roles, str):
+        allowed_roles = [r.strip() for r in allowed_roles.split(",") if r.strip()]
+    return any(r in allowed_roles for r in user_roles)
+
+def get_theme_head_tags(title: str = "OmusuBI Secure Share") -> str:
+    cfg = get_system_config()
+    default_theme = cfg.get("default_theme", "system")
+    return f"""  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <script>
+    (function() {{
+      try {{
+        var stored = localStorage.getItem('omusubi_theme');
+        var defTheme = '{default_theme}';
+        var theme = stored || (defTheme === 'system' ? (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : defTheme);
+        document.documentElement.setAttribute('data-theme', theme || 'light');
+      }} catch(e) {{}}
+    }})();
+    function toggleTheme() {{
+      var cur = document.documentElement.getAttribute('data-theme') || 'light';
+      var next = cur === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      try {{ localStorage.setItem('omusubi_theme', next); }} catch(e) {{}}
+      var btn = document.getElementById('theme-toggle-btn');
+      if (btn) btn.setAttribute('aria-label', next === 'dark' ? 'ライトモードに切替' : 'ダークモードに切替');
+    }}
+  </script>"""
+
+def get_theme_toggle_button() -> str:
+    return """<button type="button" id="theme-toggle-btn" class="theme-toggle-btn" onclick="toggleTheme()" title="ダーク/ライトモード切替" aria-label="テーマ切替">
+      <span class="theme-icon-sun">☀️</span>
+      <span class="theme-icon-moon">🌙</span>
+      <span class="theme-toggle-text">モード切替</span>
+    </button>"""
+
+def get_common_theme_css() -> str:
+    return """
+    :root {
+      --bg-body: #f8fafc;
+      --bg-card: #ffffff;
+      --bg-card-sub: #f1f5f9;
+      --border-main: #e2e8f0;
+      --border-sub: #cbd5e1;
+      --text-main: #0f172a;
+      --text-sub: #475569;
+      --text-muted: #64748b;
+      --input-bg: #ffffff;
+      --input-border: #cbd5e1;
+      --input-text: #0f172a;
+      --th-bg: #f8fafc;
+      --tr-hover: #f1f5f9;
+      --card-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+    }
+    [data-theme="dark"] {
+      --bg-body: #0b0f19;
+      --bg-card: #161e2e;
+      --bg-card-sub: #0f172a;
+      --border-main: #1e293b;
+      --border-sub: #334155;
+      --text-main: #f8fafc;
+      --text-sub: #cbd5e1;
+      --text-muted: #94a3b8;
+      --input-bg: #0f172a;
+      --input-border: #475569;
+      --input-text: #f8fafc;
+      --th-bg: #1e293b;
+      --tr-hover: #1e293b;
+      --card-shadow: 0 10px 25px -5px rgba(0,0,0,0.4);
+    }
+    .theme-toggle-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--bg-card-sub);
+      color: var(--text-main);
+      border: 1px solid var(--border-sub);
+      transition: all 0.2s ease;
+    }
+    .theme-toggle-btn:hover {
+      border-color: #2563eb;
+      transform: translateY(-1px);
+    }
+    [data-theme="dark"] .theme-icon-sun { display: inline; }
+    [data-theme="dark"] .theme-icon-moon { display: none; }
+    [data-theme="light"] .theme-icon-sun { display: none; }
+    [data-theme="light"] .theme-icon-moon { display: inline; }
+
+    /* 高コントラスト状態バッジ（ライト・ダーク両対応） */
+    .badge-status-active {
+      background: #d1fae5 !important;
+      border: 1px solid #10b981 !important;
+      color: #065f46 !important;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 700;
+      display: inline-block;
+      white-space: nowrap;
+    }
+    [data-theme="dark"] .badge-status-active {
+      background: rgba(16, 185, 129, 0.2) !important;
+      border: 1px solid #10b981 !important;
+      color: #34d399 !important;
+    }
+    .badge-status-revoked {
+      background: #fee2e2 !important;
+      border: 1px solid #ef4444 !important;
+      color: #991b1b !important;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 700;
+      display: inline-block;
+      white-space: nowrap;
+    }
+    [data-theme="dark"] .badge-status-revoked {
+      background: rgba(239, 68, 68, 0.2) !important;
+      border: 1px solid #ef4444 !important;
+      color: #fca5a5 !important;
+    }
+    .badge-status-expired {
+      background: #e2e8f0 !important;
+      border: 1px solid #94a3b8 !important;
+      color: #334155 !important;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 700;
+      display: inline-block;
+      white-space: nowrap;
+    }
+    [data-theme="dark"] .badge-status-expired {
+      background: rgba(100, 116, 139, 0.2) !important;
+      border: 1px solid #64748b !important;
+      color: #cbd5e1 !important;
+    }
+    .bulk-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      background: var(--bg-card-sub);
+      border: 1px solid var(--border-sub);
+      border-radius: 8px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .bulk-btn {
+      border: none;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+    }
+    .bulk-btn:hover {
+      opacity: 0.9;
+      transform: translateY(-1px);
+    }
+    .bulk-btn-danger {
+      background: #dc2626;
+      color: #ffffff;
+    }
+    .bulk-btn-success {
+      background: #059669;
+      color: #ffffff;
+    }
+    .bulk-btn-warning {
+      background: #d97706;
+      color: #ffffff;
+    }
+    """
+
+def get_system_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            logger.warning(f"Failed to load config from {CONFIG_PATH}: {e}")
+    return cfg
+
+def save_system_config(new_cfg: dict) -> bool:
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        tmp = f"{CONFIG_PATH}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(new_cfg, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CONFIG_PATH)
+        os.chmod(CONFIG_PATH, 0o600)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save system config: {e}")
+        return False
+
 
 # ロギング設定 (平文OTPや秘密鍵の出力を完全禁止)
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -428,7 +724,15 @@ def verify_admin_session(token_str: str, kek: bytes) -> bool:
         return False
 
 def is_authorized_manager(request: web.Request, meta: dict, kek: bytes) -> bool:
-    """送信者本人（管理キー所持）または管理者セッションを検証"""
+    """送信者本人（管理キー所持）、SSO管理者、またはレガシー管理者セッションを検証"""
+    sso_user = get_current_sso_user(request, kek)
+    if is_sso_admin(sso_user):
+        return True
+    if sso_user:
+        user_email = sso_user.get("email", "").lower().strip()
+        share_from = meta.get("mail_from", "").lower().strip()
+        if user_email and share_from and (user_email in share_from or share_from in user_email):
+            return True
     admin_cookie = request.cookies.get("secure_share_admin_session")
     if verify_admin_session(admin_cookie, kek):
         return True
@@ -438,16 +742,26 @@ def is_authorized_manager(request: web.Request, meta: dict, kek: bytes) -> bool:
         return True
     return False
 
-def is_share_expired(meta: dict) -> bool:
+def get_share_expiry_dt(meta: dict) -> datetime:
+    """共有リンクの有効期限日時（datetime）を取得"""
+    expires_at = meta.get("expires_at")
+    if expires_at:
+        try:
+            return datetime.fromisoformat(expires_at)
+        except Exception:
+            pass
     created_at = meta.get("created_at")
     expire_days = meta.get("expire_days", EXPIRE_DAYS)
-    if not created_at:
-        return False
-    try:
-        created_dt = datetime.fromisoformat(created_at)
-        return datetime.now() > created_dt + timedelta(days=expire_days)
-    except Exception:
-        return False
+    if created_at:
+        try:
+            return datetime.fromisoformat(created_at) + timedelta(days=expire_days)
+        except Exception:
+            pass
+    return datetime.now() + timedelta(days=EXPIRE_DAYS)
+
+def is_share_expired(meta: dict) -> bool:
+    exp_dt = get_share_expiry_dt(meta)
+    return datetime.now() > exp_dt
 
 # === セッション管理 ===
 
@@ -560,6 +874,24 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
     created_dt = datetime.fromisoformat(meta.get("created_at", datetime.now().isoformat()))
     expire_dt = created_dt + timedelta(days=meta.get("expire_days", EXPIRE_DAYS))
     days_left = max(0, (expire_dt - datetime.now()).days)
+    
+    # 詳細失効日時 (時分まで) & 残り時間フォーマット
+    expire_str = expire_dt.strftime("%Y/%m/%d %H:%M")
+    now_dt = datetime.now()
+    diff = expire_dt - now_dt
+    if diff.total_seconds() > 0:
+        d = diff.days
+        h = int(diff.seconds // 3600)
+        m = int((diff.seconds % 3600) // 60)
+        if d > 0:
+            rem_str = f"残り{d}日{h}時間"
+        elif h > 0:
+            rem_str = f"残り{h}時間{m}分"
+        else:
+            rem_str = f"残り{m}分"
+        expire_display = f"{expire_str} まで ({rem_str})"
+    else:
+        expire_display = f"{expire_str} (期限切れ)" 
 
     if is_share_expired(meta):
         return f"""<!DOCTYPE html>
@@ -586,109 +918,110 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
 </html>"""
 
     # スタイル定義
-    style = """
-    * { box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #f8fafc; color: #1e293b; margin: 0; padding: 0; min-height: 100vh; display: flex; flex-direction: column; }
-    .header { background: #ffffff; border-bottom: 1px solid #e2e8f0; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
-    .logo { display: flex; align-items: center; gap: 10px; font-weight: bold; font-size: 16px; color: #0f172a; }
-    .container { flex: 1; max-width: 960px; width: 100%; margin: 32px auto; padding: 0 16px; }
-    .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); padding: 28px; }
-    .summary-box { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 20px; background: #f1f5f9; border-radius: 10px; margin-bottom: 24px; }
-    .summary-title { font-weight: bold; font-size: 18px; color: #0f172a; word-break: break-all; margin-bottom: 6px; }
-    .summary-meta { font-size: 13px; color: #64748b; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
-    .badge { display: inline-block; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; background: #e0f2fe; color: #0369a1; }
-    .badge-count { background: #dcfce7; color: #166534; }
-    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; border: none; transition: background 0.15s, transform 0.05s; }
-    .btn:active { transform: scale(0.98); }
-    .btn-primary { background: #2563eb; color: #ffffff; }
-    .btn-primary:hover { background: #1d4ed8; }
-    .btn-success { background: #059669; color: #ffffff; }
-    .btn-success:hover { background: #047857; }
-    .btn-secondary { background: #e2e8f0; color: #334155; }
-    .btn-secondary:hover { background: #cbd5e1; }
-    .btn-warning { background: #f59e0b; color: #ffffff; }
-    .btn-warning:hover { background: #d97706; }
-    .btn-outline { background: #ffffff; color: #0284c7; border: 1px solid #0284c7; }
-    .btn-outline:hover { background: #f0f9ff; }
-    .zip-table th { background: #f1f5f9; padding: 6px 10px; font-weight: 600; color: #475569; }
-    .zip-table td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; }
+    style = f"""
+    {get_common_theme_css()}
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: var(--bg-body); color: var(--text-main); margin: 0; padding: 0; min-height: 100vh; display: flex; flex-direction: column; }}
+    .header {{ background: var(--bg-card); border-bottom: 1px solid var(--border-main); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }}
+    .logo {{ display: flex; align-items: center; gap: 10px; font-weight: bold; font-size: 16px; color: var(--text-main); }}
+    .container {{ flex: 1; max-width: 960px; width: 100%; margin: 32px auto; padding: 0 16px; }}
+    .card {{ background: var(--bg-card); border: 1px solid var(--border-sub); border-radius: 12px; box-shadow: var(--card-shadow); padding: 28px; }}
+    .summary-box {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 20px; background: var(--bg-card-sub); border: 1px solid var(--border-main); border-radius: 10px; margin-bottom: 24px; }}
+    .summary-title {{ font-weight: bold; font-size: 18px; color: var(--text-main); word-break: break-all; margin-bottom: 6px; }}
+    .summary-meta {{ font-size: 13px; color: var(--text-muted); display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }}
+    .badge {{ display: inline-block; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; background: rgba(56, 189, 248, 0.2); color: #0284c7; }}
+    .badge-count {{ background: rgba(16, 185, 129, 0.2); color: #059669; }}
+    .btn {{ display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; border: none; transition: background 0.15s, transform 0.05s; }}
+    .btn:active {{ transform: scale(0.98); }}
+    .btn-primary {{ background: #2563eb; color: #ffffff; }}
+    .btn-primary:hover {{ background: #1d4ed8; }}
+    .btn-success {{ background: #059669; color: #ffffff; }}
+    .btn-success:hover {{ background: #047857; }}
+    .btn-secondary {{ background: var(--bg-card-sub); color: var(--text-main); border: 1px solid var(--border-sub); }}
+    .btn-secondary:hover {{ background: var(--border-main); }}
+    .btn-warning {{ background: #f59e0b; color: #ffffff; }}
+    .btn-warning:hover {{ background: #d97706; }}
+    .btn-outline {{ background: var(--bg-card); color: #0284c7; border: 1px solid #0284c7; }}
+    .btn-outline:hover {{ background: var(--bg-card-sub); }}
+    .zip-table th {{ background: var(--th-bg); padding: 6px 10px; font-weight: 600; color: var(--text-muted); }}
+    .zip-table td {{ padding: 6px 10px; border-bottom: 1px solid var(--border-main); color: var(--text-main); }}
 
-    .btn-sm { padding: 6px 14px; font-size: 13px; border-radius: 6px; }
-    .form-group { margin-bottom: 20px; }
-    .form-group label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; color: #334155; }
-    .form-control { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 15px; }
-    .form-control:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
-    .alert-error { background: #fef2f2; border: 1px solid #fecaca; color: #dc2626; padding: 12px 16px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; }
-    .alert-success { background: #f0fdf4; border: 1px solid #bbf7d0; color: #16a34a; padding: 12px 16px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; }
+    .btn-sm {{ padding: 6px 14px; font-size: 13px; border-radius: 6px; }}
+    .form-group {{ margin-bottom: 20px; }}
+    .form-group label {{ display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; color: var(--text-sub); }}
+    .form-control {{ width: 100%; padding: 12px 14px; border: 1px solid var(--input-border); border-radius: 8px; font-size: 15px; background: var(--input-bg); color: var(--input-text); }}
+    .form-control:focus {{ outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }}
+    .alert-error {{ background: #fef2f2; border: 1px solid #fecaca; color: #dc2626; padding: 12px 16px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; }}
+    .alert-success {{ background: #f0fdf4; border: 1px solid #bbf7d0; color: #16a34a; padding: 12px 16px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; }}
     
     /* ファイルテーブル */
-    .file-table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-    .file-table th { text-align: left; padding: 12px 16px; background: #f8fafc; color: #64748b; font-size: 12px; font-weight: 600; text-transform: uppercase; border-bottom: 1px solid #e2e8f0; }
-    .file-table td { padding: 16px; border-bottom: 1px solid #e2e8f0; vertical-align: middle; }
-    .file-table tr:hover { background: #f8fafc; }
-    .file-cell { display: flex; align-items: center; gap: 12px; }
-    .file-icon { font-size: 26px; }
-    .file-title { font-weight: 600; font-size: 14px; color: #1e293b; word-break: break-all; }
-    .file-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .file-table {{ width: 100%; border-collapse: collapse; margin-top: 16px; background: var(--bg-card-sub); border-radius: 8px; overflow: hidden; }}
+    .file-table th {{ text-align: left; padding: 12px 16px; background: var(--th-bg); color: var(--text-muted); font-size: 12px; font-weight: 600; text-transform: uppercase; border-bottom: 1px solid var(--border-main); }}
+    .file-table td {{ padding: 16px; border-bottom: 1px solid var(--border-main); vertical-align: middle; color: var(--text-main); }}
+    .file-table tr:hover {{ background: var(--tr-hover); }}
+    .file-cell {{ display: flex; align-items: center; gap: 12px; }}
+    .file-icon {{ font-size: 26px; }}
+    .file-title {{ font-weight: 600; font-size: 14px; color: var(--text-main); word-break: break-all; }}
+    .file-actions {{ display: flex; gap: 8px; justify-content: flex-end; }}
     
     /* スプリットビュー & レイアウトコンテナ */
-    .container { flex: 1; max-width: 980px; width: 100%; margin: 28px auto; padding: 0 16px; transition: max-width 0.25s ease-in-out; }
-    .container.has-preview { max-width: 1560px; }
-    .main-layout { display: flex; flex-direction: column; gap: 24px; width: 100%; }
+    .container {{ flex: 1; max-width: 980px; width: 100%; margin: 28px auto; padding: 0 16px; transition: max-width 0.25s ease-in-out; }}
+    .container.has-preview {{ max-width: 1560px; }}
+    .main-layout {{ display: flex; flex-direction: column; gap: 24px; width: 100%; }}
 
-    @media (min-width: 1024px) {
-      .main-layout.has-preview {
+    @media (min-width: 1024px) {{
+      .main-layout.has-preview {{
         display: grid;
         grid-template-columns: minmax(420px, 480px) minmax(560px, 1fr);
         align-items: start;
         gap: 24px;
-      }
-      .files-card {
+      }}
+      .files-card {{
         position: sticky;
         top: 20px;
-      }
-      .preview-card {
+      }}
+      .preview-card {{
         position: sticky;
         top: 20px;
         max-height: calc(100vh - 40px);
         display: flex;
         flex-direction: column;
         overflow: hidden;
-      }
-      .preview-body {
+      }}
+      .preview-body {{
         flex: 1;
         overflow-y: auto;
-      }
-      .preview-body iframe {
+      }}
+      .preview-body iframe {{
         height: calc(100vh - 120px) !important;
         min-height: 600px;
-      }
-    }
+      }}
+    }}
 
-    @media (max-width: 1023px) {
-      .preview-card {
+    @media (max-width: 1023px) {{
+      .preview-card {{
         margin-top: 16px;
-      }
-      .preview-body iframe {
+      }}
+      .preview-body iframe {{
         height: 550px;
-      }
-    }
+      }}
+    }}
 
-    .file-row-active {
-      background-color: #eff6ff !important;
+    .file-row-active {{
+      background-color: rgba(37, 99, 235, 0.15) !important;
       border-left: 3px solid #2563eb;
-    }
+    }}
 
     /* プレビューコンテナ */
-    .preview-card { border: 1px solid #cbd5e1; border-radius: 12px; overflow: hidden; background: #ffffff; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.08); padding: 0; }
-    .preview-header { padding: 12px 18px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .preview-header-title { font-weight: 600; font-size: 14px; color: #1e293b; display: flex; align-items: center; gap: 8px; min-width: 0; }
-    #preview-filename-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .preview-body { min-height: 480px; display: flex; align-items: center; justify-content: center; background: #525659; }
-    .preview-body iframe { width: 100%; height: 750px; border: none; background: #fff; }
-    .preview-body img { max-width: 100%; max-height: 750px; border-radius: 4px; object-fit: contain; }
-    .preview-body pre { width: 100%; height: 600px; margin: 0; padding: 20px; background: #ffffff; color: #1e293b; overflow: auto; font-family: monospace; font-size: 13px; line-height: 1.5; }
-.footer { text-align: center; padding: 24px; font-size: 12px; color: #94a3b8; }
+    .preview-card {{ border: 1px solid var(--border-sub); border-radius: 12px; overflow: hidden; background: var(--bg-card); box-shadow: var(--card-shadow); padding: 0; }}
+    .preview-header {{ padding: 12px 18px; background: var(--bg-card-sub); border-bottom: 1px solid var(--border-main); display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
+    .preview-header-title {{ font-weight: 600; font-size: 14px; color: var(--text-main); display: flex; align-items: center; gap: 8px; min-width: 0; }}
+    #preview-filename-label {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .preview-body {{ min-height: 480px; display: flex; align-items: center; justify-content: center; background: #525659; }}
+    .preview-body iframe {{ width: 100%; height: 750px; border: none; background: #fff; }}
+    .preview-body img {{ max-width: 100%; max-height: 750px; border-radius: 4px; object-fit: contain; }}
+    .preview-body pre {{ width: 100%; height: 600px; margin: 0; padding: 20px; background: var(--bg-card); color: var(--text-main); overflow: auto; font-family: monospace; font-size: 13px; line-height: 1.5; }}
+    .footer {{ text-align: center; padding: 24px; font-size: 12px; color: var(--text-muted); }}
     """
 
     err_html = f'<div class="alert-error">{error_msg}</div>' if error_msg else ""
@@ -789,7 +1122,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
               <div class="summary-meta">
                 <span class="badge badge-count">📎 添付ファイル: {file_count} 件</span>
                 <span>合計: <strong>{total_size_str}</strong></span>
-                <span>有効期限: 残り <strong>{days_left} 日</strong></span>
+                <span>有効期限: <strong>{expire_display}</strong></span>
                 <span class="badge">🔒 AES-256-GCM 暗号化保護</span>
               </div>
             </div>
@@ -1381,7 +1714,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
             <div style="flex: 1;">
               <div style="font-weight: bold; font-size: 15px; color: #0f172a;">{title}</div>
               <div style="font-size: 12px; color: #64748b; margin-top: 2px;">
-                ファイル: {file_count} 件 ({total_size_str}) &nbsp;|&nbsp; 期限: 残り{days_left}日
+                ファイル: {file_count} 件 ({total_size_str}) &nbsp;|&nbsp; 期限: {expire_display}
               </div>
             </div>
           </div>
@@ -1407,7 +1740,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
               <button type="submit" class="btn btn-secondary" style="font-size: 12px; padding: 6px 14px;">コードを再送する</button>
             </form>
             &nbsp;
-            <a href="/share/{token}" style="font-size: 12px; color: #64748b; text-decoration: underline;">メールアドレスを変更</a>
+            <a href="/share/{token}?step=email&reset=1" style="font-size: 12px; color: #64748b; text-decoration: underline;">メールアドレスを変更</a>
           </div>
         </div>
         """
@@ -1420,7 +1753,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
             <div style="flex: 1;">
               <div style="font-weight: bold; font-size: 15px; color: #0f172a;">{title}</div>
               <div style="font-size: 12px; color: #64748b; margin-top: 2px;">
-                ファイル: {file_count} 件 ({total_size_str}) &nbsp;|&nbsp; 期限: 残り{days_left}日
+                ファイル: {file_count} 件 ({total_size_str}) &nbsp;|&nbsp; 期限: {expire_display}
               </div>
             </div>
           </div>
@@ -1449,9 +1782,7 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title} - OmusuBI 安全ファイル共有</title>
+  {get_theme_head_tags(f"{title} - OmusuBI 安全ファイル共有")}
   <style>{style}</style>
 </head>
 <body>
@@ -1460,8 +1791,11 @@ def render_page(token: str, meta: dict, step: str = "email", error_msg: str = ""
       <span>🍙</span>
       <span>OmusuBI 安全ファイル共有 (Webダウンロードポータル)</span>
     </div>
-    <div style="font-size: 12px; color: #64748b;">
-      受信者限定アクセス
+    <div style="display:flex; align-items:center; gap:14px;">
+      {get_theme_toggle_button()}
+      <div style="font-size: 12px; color: var(--text-muted, #64748b);">
+        受信者限定アクセス
+      </div>
     </div>
   </div>
   <div class="container">
@@ -1833,52 +2167,215 @@ def render_approval_page(pending_info: dict, approve_token: str, error: str = ""
 </html>"""
 
 def render_admin_login(error: str = "") -> str:
-    """管理者ログイン画面"""
+    """管理者ログイン画面 (Keycloak SSO & パスワード認証両対応)"""
     err_html = f'<div style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:10px 14px; border-radius:6px; margin-bottom:16px; font-size:13px;">{html.escape(error)}</div>' if error else ""
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>管理者ログイン - OmusuBI Secure Share</title>
+  {get_theme_head_tags("管理者ログイン - OmusuBI Secure Share")}
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #0b0f19; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
-    .card {{ background: #161e2e; border: 1px solid #334155; border-radius: 12px; padding: 36px 30px; max-width: 400px; width: 100%; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }}
-    input[type=password] {{ width: 100%; box-sizing: border-box; background: #0f172a; border: 1px solid #475569; border-radius: 6px; padding: 12px 14px; color: #fff; font-size: 14px; margin-bottom: 16px; }}
-    input[type=password]:focus {{ outline: none; border-color: #38bdf8; ring: 2px #38bdf8; }}
-    button {{ width: 100%; background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 12px; font-size: 15px; font-weight: bold; cursor: pointer; }}
-    button:hover {{ background: #1d4ed8; }}
+    {get_common_theme_css()}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: var(--bg-body); color: var(--text-main); display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
+    .card {{ background: var(--bg-card); border: 1px solid var(--border-sub); border-radius: 12px; padding: 36px 30px; max-width: 440px; width: 100%; box-shadow: var(--card-shadow); }}
+    input[type=password] {{ width: 100%; box-sizing: border-box; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 6px; padding: 12px 14px; color: var(--input-text); font-size: 14px; margin-bottom: 16px; }}
+    input[type=password]:focus {{ outline: none; border-color: #38bdf8; }}
+    .btn-sso {{ display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; padding: 14px; border-radius: 8px; font-weight: bold; font-size: 15px; text-decoration: none; box-shadow: 0 4px 12px rgba(37,99,235,0.3); transition: transform 0.1s; box-sizing: border-box; }}
+    .btn-sso:hover {{ transform: translateY(-1px); filter: brightness(1.05); }}
+    .btn-local {{ width: 100%; background: var(--bg-card-sub); color: var(--text-main); border: 1px solid var(--border-sub); border-radius: 6px; padding: 12px; font-size: 14px; font-weight: bold; cursor: pointer; }}
+    .btn-local:hover {{ background: #2563eb; color: #fff; border-color: #2563eb; }}
   </style>
 </head>
 <body>
   <div class="card">
+    <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
+      {get_theme_toggle_button()}
+    </div>
     <div style="text-align:center; margin-bottom:24px;">
       <div style="font-size:42px; margin-bottom:8px;">🔒</div>
-      <h1 style="font-size:18px; margin:0; font-weight:bold;">OmusuBI 管理者ポータル</h1>
-      <div style="font-size:12px; color:#94a3b8; margin-top:4px;">Secure Share & 誤送信防止統合管理</div>
+      <h1 style="font-size:20px; margin:0; font-weight:bold;">OmusuBI 管理者ポータル</h1>
+      <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">Keycloak SSO 統合認証 & Secure Share 一元管理</div>
     </div>
     {err_html}
+    
+    <div style="margin-bottom:24px;">
+      <a href="/auth/login?next=/admin" class="btn-sso">
+        <span>🍙</span> OmusuBI SSO (Keycloak) でログイン
+      </a>
+      <div style="text-align:center; font-size:11px; color:var(--text-muted); margin-top:6px;">
+        ※ Adminロールを所持する社内アカウントでワンクリックログイン
+      </div>
+    </div>
+
+    <div style="display:flex; align-items:center; margin:20px 0; color:var(--text-muted); font-size:12px;">
+      <div style="flex:1; height:1px; background:var(--border-main);"></div>
+      <span style="padding:0 10px;">または バックアップパスワード</span>
+      <div style="flex:1; height:1px; background:var(--border-main);"></div>
+    </div>
+
     <form method="POST" action="/admin/login">
       <div style="margin-bottom:16px;">
-        <label style="display:block; font-size:12px; color:#cbd5e1; margin-bottom:6px; font-weight:600;">管理者パスワード</label>
-        <input type="password" name="password" required autofocus placeholder="管理者パスワードを入力">
+        <label style="display:block; font-size:12px; color:var(--text-sub); margin-bottom:6px; font-weight:600;">管理者パスワード</label>
+        <input type="password" name="password" required placeholder="管理者パスワードを入力">
       </div>
-      <button type="submit">ログイン</button>
+      <button type="submit" class="btn-local">パスワードでログイン</button>
     </form>
-    <div style="margin-top:20px; text-align:center; font-size:11px; color:#64748b;">
+    <div style="margin-top:20px; text-align:center; font-size:11px; color:var(--text-muted);">
       ※ セッションは安全にHMAC署名され8時間有効です
     </div>
   </div>
 </body>
 </html>"""
 
-def render_admin_dashboard(shares: list, pending_mails: list, message: str = "", error: str = "") -> str:
-    """管理者統合ダッシュボード（Active! gate SS 準拠 管理画面）"""
+def render_forbidden_page(sso_user: dict, required_roles: list) -> str:
+    """管理者ロールを持たないSSOユーザー向け案内画面"""
+    user_name = html.escape(sso_user.get("name") or sso_user.get("username", ""))
+    roles_str = html.escape(", ".join(sso_user.get("roles", [])) or "なし")
+    req_str = html.escape(", ".join(required_roles))
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  {get_theme_head_tags("管理者権限が必要です - OmusuBI")}
+  <style>
+    {get_common_theme_css()}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: var(--bg-body); color: var(--text-main); display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }}
+    .card {{ background: var(--bg-card); border: 1px solid var(--border-sub); border-radius: 12px; box-shadow: var(--card-shadow); max-width: 520px; width: 100%; padding: 36px 28px; text-align: center; }}
+    .icon {{ font-size: 48px; margin-bottom: 16px; }}
+    h1 {{ font-size: 20px; color: #dc2626; margin: 0 0 12px; }}
+    .info-box {{ background: var(--bg-card-sub); border: 1px solid var(--border-main); border-radius: 8px; padding: 14px 18px; margin: 20px 0; text-align: left; font-size: 13px; }}
+    .btn {{ display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; border: none; }}
+    .btn-primary {{ background: #2563eb; color: #fff; }}
+    .btn-secondary {{ background: var(--bg-card-sub); color: var(--text-main); border: 1px solid var(--border-sub); }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
+      {get_theme_toggle_button()}
+    </div>
+    <div class="icon">🛑</div>
+    <h1>管理者権限（Adminロール）が必要です</h1>
+    <p style="font-size: 14px; color: var(--text-sub); line-height: 1.6;">
+      現在ログイン中のアカウント（<strong>{user_name}</strong>）には、統合管理ダッシュボードへのアクセス権限が付与されていません。<br>
+      送信済みファイルの確認やリンク管理は、社員専用ポータルをご利用ください。
+    </p>
+    <div class="info-box">
+      <div style="margin-bottom: 6px;"><strong>現在のアカウント:</strong> {user_name} ({html.escape(sso_user.get('email', ''))})</div>
+      <div style="margin-bottom: 6px;"><strong>保有ロール:</strong> <span style="font-family: monospace; color: #f59e0b;">{roles_str}</span></div>
+      <div><strong>管理画面に必要なロール:</strong> <span style="font-family: monospace; color: #10b981;">{req_str}</span></div>
+    </div>
+    <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;">
+      <a href="/my/shares" class="btn btn-primary">📁 社員用 送信管理ポータルを開く</a>
+      <a href="/auth/logout" class="btn btn-secondary">別のアカウントでログイン</a>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def render_toast_component(message: str = "", error: str = "") -> str:
+    """id. 準拠の画面右下スライドイントースト通知コンポーネント"""
+    if not message and not error:
+        return ""
+    
+    is_err = bool(error)
+    text = error if is_err else message
+    icon = "❌" if is_err else "✅"
+    title_text = "エラーが発生しました" if is_err else "通知"
+    accent_color = "#ef4444" if is_err else "#10b981"
+    
+    return f"""
+    <div id="toast-container" style="
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 99999;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    ">
+      <div id="app-toast" style="
+        min-width: 320px;
+        max-width: 440px;
+        background: #0f172a;
+        color: #f8fafc;
+        border-radius: 10px;
+        box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5), 0 8px 10px -6px rgba(0,0,0,0.4);
+        border: 1px solid #334155;
+        border-left: 5px solid {accent_color};
+        padding: 14px 18px;
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        pointer-events: auto;
+        transform: translateX(120%);
+        opacity: 0;
+        transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.35s ease;
+      ">
+        <div style="font-size: 20px; line-height: 1;">{icon}</div>
+        <div style="flex: 1;">
+          <div style="font-size: 13px; font-weight: bold; color: {accent_color}; margin-bottom: 2px;">{title_text}</div>
+          <div style="font-size: 13px; line-height: 1.4; color: #f1f5f9; font-weight: 500;">{html.escape(text)}</div>
+        </div>
+        <button onclick="dismissToast()" style="
+          background: none;
+          border: none;
+          color: #94a3b8;
+          font-size: 16px;
+          cursor: pointer;
+          padding: 2px 4px;
+          line-height: 1;
+        " title="閉じる">✕</button>
+      </div>
+    </div>
+    <script>
+      (function() {{
+        const toast = document.getElementById('app-toast');
+        if (!toast) return;
+        
+        requestAnimationFrame(() => {{
+          toast.style.transform = 'translateX(0)';
+          toast.style.opacity = '1';
+        }});
+        
+        const timer = setTimeout(() => {{
+          dismissToast();
+        }}, 4500);
+        
+        window.dismissToast = function() {{
+          clearTimeout(timer);
+          toast.style.transform = 'translateX(120%)';
+          toast.style.opacity = '0';
+          setTimeout(() => {{
+            const c = document.getElementById('toast-container');
+            if (c) c.remove();
+          }}, 400);
+        }};
+        
+        try {{
+          const url = new URL(window.location.href);
+          if (url.searchParams.has('msg') || url.searchParams.has('error')) {{
+            url.searchParams.delete('msg');
+            url.searchParams.delete('error');
+            window.history.replaceState({{}}, document.title, url.toString());
+          }}
+        }} catch (e) {{}}
+      }})();
+    </script>
+    """
+
+def render_admin_dashboard(shares: list, pending_mails: list, message: str = "", error: str = "", active_tab: str = "shares", sso_user: dict = None) -> str:
+    """管理者統合ダッシュボード（Active! gate SS 準拠 管理画面 & システム設定GUI）"""
     total_shares = len(shares)
     active_shares = sum(1 for s in shares if s.get("status") != "revoked" and not s.get("is_expired"))
     revoked_shares = sum(1 for s in shares if s.get("status") == "revoked")
     pending_count = len(pending_mails)
     total_dl = sum(s.get("download_count", 0) for s in shares)
+    
+    cfg = get_system_config()
+    admin_roles_val = ", ".join(cfg.get("admin_roles", ["admin", "iam-admin", "Developer", "su"]))
+    user_display = sso_user.get("name") or sso_user.get("username") if sso_user else "管理者"
+    user_email = sso_user.get("email") if sso_user else ""
 
     share_rows = ""
     for s in shares:
@@ -1890,40 +2387,44 @@ def render_admin_dashboard(shares: list, pending_mails: list, message: str = "",
         created = s.get("created_at", "")[:16].replace("T", " ")
         dl = s.get("download_count", 0)
         mgmt_key = s.get("mgmt_key", "")
+        expire_days = s.get("expire_days", EXPIRE_DAYS)
         
         is_rev = s.get("status") == "revoked"
         is_exp = s.get("is_expired", False)
         
         if is_rev:
-            status_badge = '<span style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:3px 8px; border-radius:12px; font-size:11px; font-weight:bold;">🛑 無効化</span>'
+            status_badge = '<span class="badge-status-revoked">🛑 無効化</span>'
             toggle_btn = '<form method="POST" action="/admin/api/action" style="display:inline;"><input type="hidden" name="action" value="unrevoke"><input type="hidden" name="token" value="' + tok + '"><button type="submit" style="background:#059669; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">再有効化</button></form>'
         elif is_exp:
-            status_badge = '<span style="background:rgba(100,116,139,0.2); border:1px solid #64748b; color:#cbd5e1; padding:3px 8px; border-radius:12px; font-size:11px; font-weight:bold;">⌛ 期限切れ</span>'
-            toggle_btn = '<span style="color:#64748b; font-size:11px;">-</span>'
+            status_badge = '<span class="badge-status-expired">⌛ 期限切れ</span>'
+            toggle_btn = f'''<form method="POST" action="/my/api/extend" style="display:inline;"><input type="hidden" name="token" value="{tok}"><input type="hidden" name="days" value="30"><button type="submit" style="background:#f59e0b; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">+30日延長</button></form>'''
         else:
-            status_badge = '<span style="background:rgba(16,185,129,0.2); border:1px solid #10b981; color:#6ee7b7; padding:3px 8px; border-radius:12px; font-size:11px; font-weight:bold;">🟢 有効</span>'
-            toggle_btn = f'''<form method="POST" action="/admin/api/action" onsubmit="return confirm(&quot;トークン {tok} を即時無効化しますか？&quot;);" style="display:inline;"><input type="hidden" name="action" value="revoke"><input type="hidden" name="token" value="{tok}"><button type="submit" style="background:#dc2626; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">即時無効化</button></form>'''
+            status_badge = '<span class="badge-status-active">🟢 有効</span>'
+            toggle_btn = f'''<form method="POST" action="/admin/api/action" onsubmit="return confirm(&quot;トークン {tok} を無効化しますか？&quot;);" style="display:inline;"><input type="hidden" name="action" value="revoke"><input type="hidden" name="token" value="{tok}"><button type="submit" style="background:#dc2626; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">無効化</button></form>'''
 
         manage_link = f"/share/{tok}/manage?key={urllib.parse.quote(mgmt_key)}" if mgmt_key else f"/share/{tok}"
         share_rows += f"""
         <tr>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-family:monospace; font-size:12px; color:#38bdf8;">
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center;">
+            <input type="checkbox" name="tokens" value="{tok}" class="share-chk" onchange="updateCount('share-chk','share-cnt')">
+          </td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-family:monospace; font-size:12px; color:#38bdf8;">
             <a href="{manage_link}" target="_blank" style="color:#38bdf8; text-decoration:none;">{tok[:12]}...</a>
           </td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:13px; color:#f1f5f9; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{subj}">{subj}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1;">{mail_from}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1; text-align:center;">{f_count}件 ({size_str})</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#94a3b8;">{created}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#10b981; font-weight:bold; text-align:center;">{dl}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; text-align:center;">{status_badge}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; text-align:center;">
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:13px; color:var(--text-main); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{subj}">{subj}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-sub);">{mail_from}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-sub); text-align:center;">{f_count}件 ({size_str})</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-muted);">{created}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:#10b981; font-weight:bold; text-align:center;">{dl}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center;">{status_badge}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center; white-space:nowrap;">
             {toggle_btn}
-            <a href="/share/{tok}" target="_blank" style="margin-left:6px; color:#94a3b8; font-size:11px; text-decoration:none;">受信者View</a>
+            <a href="/share/{tok}" target="_blank" style="margin-left:6px; color:var(--text-muted); font-size:11px; text-decoration:none;">受信者View</a>
           </td>
         </tr>
         """
     if not share_rows:
-        share_rows = '<tr><td colspan="8" style="padding:24px; text-align:center; color:#64748b;">発行済みの共有リンクはありません</td></tr>'
+        share_rows = '<tr><td colspan="9" style="padding:24px; text-align:center; color:var(--text-muted);">発行済みの共有リンクはありません</td></tr>'
 
     pending_rows = ""
     for p in pending_mails:
@@ -1936,12 +2437,15 @@ def render_admin_dashboard(shares: list, pending_mails: list, message: str = "",
         
         pending_rows += f"""
         <tr>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:13px; color:#f1f5f9; font-weight:bold;">{subj}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1;">{mail_from}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#38bdf8; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{rcpts}</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#cbd5e1; text-align:center;">{att_c} 件</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; font-size:12px; color:#f59e0b; font-weight:bold; text-align:center;">残り {rem}秒</td>
-          <td style="padding:10px 12px; border-bottom:1px solid #1e293b; text-align:center;">
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center;">
+            <input type="checkbox" name="tokens" value="{a_tok}" class="pending-chk" onchange="updateCount('pending-chk','pending-cnt')">
+          </td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:13px; color:var(--text-main); font-weight:bold;">{subj}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-sub);">{mail_from}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:#38bdf8; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{rcpts}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-sub); text-align:center;">{att_c} 件</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:#f59e0b; font-weight:bold; text-align:center;">残り {rem}秒</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center; white-space:nowrap;">
             <form method="POST" action="/outbound/approve/{a_tok}/action" style="display:inline;">
               <input type="hidden" name="action" value="approve">
               <button type="submit" style="background:#059669; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:bold;">✅ 承認</button>
@@ -1956,7 +2460,7 @@ def render_admin_dashboard(shares: list, pending_mails: list, message: str = "",
         </tr>
         """
     if not pending_rows:
-        pending_rows = '<tr><td colspan="6" style="padding:20px; text-align:center; color:#64748b;">現在保留中・承認待ちのメールはありません</td></tr>'
+        pending_rows = '<tr><td colspan="7" style="padding:20px; text-align:center; color:var(--text-muted);">現在保留中・承認待ちのメールはありません</td></tr>'
 
     msg_html = f'<div style="background:rgba(16,185,129,0.2); border:1px solid #10b981; color:#6ee7b7; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(message)}</div>' if message else ""
     err_html = f'<div style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(error)}</div>' if error else ""
@@ -1964,20 +2468,26 @@ def render_admin_dashboard(shares: list, pending_mails: list, message: str = "",
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OmusuBI Secure Share - 統合管理ポータル</title>
+  {get_theme_head_tags("統合管理ポータル - OmusuBI Secure Share")}
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: #0b0f19; color: #f8fafc; margin: 0; padding: 24px; }}
+    {get_common_theme_css()}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: var(--bg-body); color: var(--text-main); margin: 0; padding: 24px; }}
     .container {{ max-width: 1200px; margin: 0 auto; }}
-    .header {{ display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 24px; }}
-    .kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 28px; }}
-    .kpi-card {{ background: #161e2e; border: 1px solid #1e293b; border-radius: 10px; padding: 18px 20px; text-align: left; }}
-    .kpi-label {{ font-size: 12px; color: #94a3b8; font-weight: 600; margin-bottom: 6px; text-transform: uppercase; }}
-    .kpi-num {{ font-size: 26px; font-weight: 800; color: #f8fafc; }}
-    .card {{ background: #161e2e; border: 1px solid #334155; border-radius: 12px; padding: 24px; margin-bottom: 28px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }}
-    table {{ width: 100%; border-collapse: collapse; background: #0f172a; border-radius: 8px; overflow: hidden; }}
-    th {{ background: #1e293b; padding: 10px 12px; font-size: 12px; color: #94a3b8; font-weight: 600; text-align: left; }}
+    .header {{ display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-main); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; }}
+    .kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+    .kpi-card {{ background: var(--bg-card); border: 1px solid var(--border-main); border-radius: 10px; padding: 18px 20px; text-align: left; box-shadow: var(--card-shadow); }}
+    .kpi-label {{ font-size: 12px; color: var(--text-muted); font-weight: 600; margin-bottom: 6px; text-transform: uppercase; }}
+    .kpi-num {{ font-size: 26px; font-weight: 800; color: var(--text-main); }}
+    .card {{ background: var(--bg-card); border: 1px solid var(--border-sub); border-radius: 12px; padding: 24px; margin-bottom: 28px; box-shadow: var(--card-shadow); }}
+    table {{ width: 100%; border-collapse: collapse; background: var(--bg-card-sub); border-radius: 8px; overflow: hidden; }}
+    th {{ background: var(--th-bg); padding: 10px 12px; font-size: 12px; color: var(--text-muted); font-weight: 600; text-align: left; border-bottom: 1px solid var(--border-main); }}
+    .tabs-nav {{ display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid var(--border-main); padding-bottom: 8px; }}
+    .tab-btn {{ background: none; border: none; padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 600; color: var(--text-muted); cursor: pointer; transition: all 0.15s ease; }}
+    .tab-btn.active {{ background: #2563eb; color: #ffffff; }}
+    .form-group {{ margin-bottom: 16px; }}
+    .form-group label {{ display: block; font-size: 13px; font-weight: 600; color: var(--text-sub); margin-bottom: 6px; }}
+    .form-control {{ width: 100%; box-sizing: border-box; background: var(--input-bg); border: 1px solid var(--input-border); color: var(--input-text); border-radius: 6px; padding: 10px 12px; font-size: 14px; }}
+    .form-help {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
   </style>
 </head>
 <body>
@@ -1987,53 +2497,420 @@ def render_admin_dashboard(shares: list, pending_mails: list, message: str = "",
         <span style="font-size:32px;">🎛️</span>
         <div>
           <h1 style="font-size:20px; margin:0; font-weight:bold;">OmusuBI Secure Share 統合管理ダッシュボード</h1>
-          <div style="font-size:12px; color:#94a3b8;">Active! gate SS 準拠 送信保留・上長承認・リンク即時無効化（キルスイッチ）一元管理</div>
+          <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">
+            ログイン中: <strong>{user_display}</strong> {f'({user_email})' if user_email else ''} <span style="background:rgba(37,99,235,0.2); color:#60a5fa; padding:2px 6px; border-radius:4px; font-size:10px;">Admin</span>
+          </div>
         </div>
       </div>
-      <div>
-        <a href="/admin/logout" style="background:#334155; color:#cbd5e1; text-decoration:none; padding:8px 16px; border-radius:6px; font-size:13px; font-weight:600;">ログアウト</a>
+      <div style="display:flex; align-items:center; gap:10px;">
+        {get_theme_toggle_button()}
+        <a href="/my/shares" style="background:#2563eb; color:#fff; text-decoration:none; padding:8px 14px; border-radius:6px; font-size:13px; font-weight:600;">📁 社員送信ポータル</a>
+        <a href="/auth/logout" style="background:var(--bg-card-sub); color:var(--text-main); border:1px solid var(--border-sub); text-decoration:none; padding:8px 14px; border-radius:6px; font-size:13px; font-weight:600;">ログアウト</a>
       </div>
     </div>
 
     {msg_html}
     {err_html}
 
-    <div class="kpi-row">
-      <div class="kpi-card">
-        <div class="kpi-label">🟢 有効共有リンク</div>
-        <div class="kpi-num" style="color:#10b981;">{active_shares} <span style="font-size:14px; font-weight:normal; color:#64748b;">/ {total_shares} 件</span></div>
+    <div class="tabs-nav">
+      <button type="button" class="tab-btn {'active' if active_tab == 'shares' else ''}" onclick="switchTab('shares')">📁 発行済み共有リンク ({total_shares} 件)</button>
+      <button type="button" class="tab-btn {'active' if active_tab == 'pending' else ''}" onclick="switchTab('pending')">⏳ 送信保留・上長承認キュー ({pending_count} 件)</button>
+      <button type="button" class="tab-btn {'active' if active_tab == 'settings' else ''}" onclick="switchTab('settings')">⚙️ システム設定 (ポリシー・SSOロール)</button>
+    </div>
+
+    <!-- TAB 1: 共有リンク管理 -->
+    <div id="tab-shares" style="display: {'block' if active_tab == 'shares' else 'none'};">
+      <div class="kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-label">🟢 有効共有リンク</div>
+          <div class="kpi-num" style="color:#10b981;">{active_shares} <span style="font-size:14px; font-weight:normal; color:var(--text-muted);">/ {total_shares} 件</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">🛑 即時無効化リンク</div>
+          <div class="kpi-num" style="color:#ef4444;">{revoked_shares} <span style="font-size:14px; font-weight:normal; color:var(--text-muted);">件</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">⏳ 保留・承認待ちメール</div>
+          <div class="kpi-num" style="color:#f59e0b;">{pending_count} <span style="font-size:14px; font-weight:normal; color:var(--text-muted);">通</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">📥 累計ダウンロード</div>
+          <div class="kpi-num" style="color:#38bdf8;">{total_dl} <span style="font-size:14px; font-weight:normal; color:var(--text-muted);">回</span></div>
+        </div>
       </div>
-      <div class="kpi-card">
-        <div class="kpi-label">🛑 即時無効化リンク</div>
-        <div class="kpi-num" style="color:#ef4444;">{revoked_shares} <span style="font-size:14px; font-weight:normal; color:#64748b;">件</span></div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-label">⏳ 保留・承認待ちメール</div>
-        <div class="kpi-num" style="color:#f59e0b;">{pending_count} <span style="font-size:14px; font-weight:normal; color:#64748b;">通</span></div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-label">📥 累計ダウンロード</div>
-        <div class="kpi-num" style="color:#38bdf8;">{total_dl} <span style="font-size:14px; font-weight:normal; color:#64748b;">回</span></div>
+
+      <div class="card">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+          <h2 style="font-size:16px; margin:0; color:var(--text-main); display:flex; align-items:center; gap:8px;">
+            <span>📁</span> 発行済み共有リンク管理 ({total_shares} 件)
+          </h2>
+          <span style="font-size:12px; color:var(--text-muted);">暗号化保管中のファイル共有リンク & キルスイッチ操作</span>
+        </div>
+        <form method="POST" action="/admin/api/bulk-shares">
+          <div class="bulk-toolbar">
+            <span style="font-size:12px; font-weight:600; color:var(--text-sub);">一括操作:</span>
+            <button type="submit" name="action" value="revoke" class="bulk-btn bulk-btn-danger" onclick="return confirm('選択した共有リンクを一括無効化しますか？受取人からのアクセスが直ちに遮断されます。');">
+              🛑 一括無効化
+            </button>
+            <button type="submit" name="action" value="unrevoke" class="bulk-btn bulk-btn-success" onclick="return confirm('選択した共有リンクを一括再有効化しますか？');">
+              🟢 一括再有効化
+            </button>
+            <span id="share-cnt" style="font-size:12px; color:var(--text-muted); margin-left:auto;">0 件選択中</span>
+          </div>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:36px; text-align:center;"><input type="checkbox" title="すべて選択/解除" onclick="toggleAll('share-chk', this.checked, 'share-cnt')"></th>
+                  <th>トークン</th>
+                  <th>件名</th>
+                  <th>送信元</th>
+                  <th style="text-align:center;">ファイル / 容量</th>
+                  <th>作成日時</th>
+                  <th style="text-align:center;">DL数</th>
+                  <th style="text-align:center;">ステータス</th>
+                  <th style="text-align:center;">アクション</th>
+                </tr>
+              </thead>
+              <tbody>
+                {share_rows}
+              </tbody>
+            </table>
+          </div>
+        </form>
       </div>
     </div>
 
+    <!-- TAB 2: 送信保留・上長承認キュー -->
+    <div id="tab-pending" style="display: {'block' if active_tab == 'pending' else 'none'};">
+      <div class="card">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+          <h2 style="font-size:16px; margin:0; color:var(--text-main); display:flex; align-items:center; gap:8px;">
+            <span>⏳</span> 送信保留・上長承認キュー ({pending_count} 件)
+          </h2>
+          <span style="font-size:12px; color:var(--text-muted);">80秒保留待機中または上長承認待ちの社外宛てメール</span>
+        </div>
+        <form method="POST" action="/admin/api/bulk-pending">
+          <div class="bulk-toolbar">
+            <span style="font-size:12px; font-weight:600; color:var(--text-sub);">一括操作:</span>
+            <button type="submit" name="action" value="approve" class="bulk-btn bulk-btn-success" onclick="return confirm('選択した保留メールを一括送信許可（直ちに宛先へ配送）しますか？');">
+              ✅ 一括送信許可（承認）
+            </button>
+            <button type="submit" name="action" value="reject" class="bulk-btn bulk-btn-danger" onclick="return confirm('選択した保留メールを一括取り消し（配送中止）しますか？');">
+              🛑 一括送信取り消し
+            </button>
+            <span id="pending-cnt" style="font-size:12px; color:var(--text-muted); margin-left:auto;">0 件選択中</span>
+          </div>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:36px; text-align:center;"><input type="checkbox" title="すべて選択/解除" onclick="toggleAll('pending-chk', this.checked, 'pending-cnt')"></th>
+                  <th>件名</th>
+                  <th>送信元</th>
+                  <th>宛先</th>
+                  <th style="text-align:center;">添付</th>
+                  <th style="text-align:center;">保留状態</th>
+                  <th style="text-align:center;">アクション</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pending_rows}
+              </tbody>
+            </table>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- TAB 3: システム設定 -->
+    <div id="tab-settings" style="display: {'block' if active_tab == 'settings' else 'none'};">
+      <div class="card" style="max-width:800px;">
+        <h2 style="font-size:16px; margin:0 0 20px 0; color:var(--text-main); display:flex; align-items:center; gap:8px;">
+          <span>⚙️</span> システム設定（Active! gate SS 準拠 ポリシー & SSO管理設定）
+        </h2>
+
+        <form method="POST" action="/admin/api/settings">
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+            <div class="form-group">
+              <label>誤送信防止 送信保留秒数（秒）</label>
+              <input type="number" name="outbound_delay_seconds" class="form-control" value="{cfg.get('outbound_delay_seconds', 80)}" min="0" max="600" required>
+              <div class="form-help">社外宛てメール送信時の取り消し猶予秒数（0で即時送信）</div>
+            </div>
+
+            <div class="form-group">
+              <label>Bcc強制変換 宛先しきい値（件）</label>
+              <input type="number" name="bcc_convert_threshold" class="form-control" value="{cfg.get('bcc_convert_threshold', 10)}" min="2" max="100" required>
+              <div class="form-help">社外宛先がこの件数以上のときTo/Ccを自動でBccへ変換</div>
+            </div>
+
+            <div class="form-group">
+              <label>ファイル共有 有効期限（日数）</label>
+              <input type="number" name="default_expire_days" class="form-control" value="{cfg.get('default_expire_days', 60)}" min="1" max="365" required>
+              <div class="form-help">共有リンクの既定の有効期限日数（失効後は自動削除）</div>
+            </div>
+
+            <div class="form-group">
+              <label>ワンタイム確認コード(OTP) 有効期限（分）</label>
+              <input type="number" name="otp_expiry_minutes" class="form-control" value="{cfg.get('otp_expiry_minutes', 10)}" min="1" max="60" required>
+              <div class="form-help">受信者宛て確認コードの有効期限</div>
+            </div>
+
+            <div class="form-group">
+              <label>OTP 最大試行回数（回）</label>
+              <input type="number" name="otp_max_attempts" class="form-control" value="{cfg.get('otp_max_attempts', 5)}" min="1" max="20" required>
+              <div class="form-help">誤入力時の上限試行回数（超過時はセッション失効）</div>
+            </div>
+
+            <div class="form-group">
+              <label>添付ファイル最大サイズ上限（GB）</label>
+              <input type="number" name="data_size_limit_gb" class="form-control" value="{cfg.get('data_size_limit_gb', 0)}" min="0" max="100">
+              <div class="form-help">0 または空欄で <strong>無制限（Unlimited）</strong></div>
+            </div>
+
+            <div class="form-group">
+              <label>既定カラーテーマ</label>
+              <select name="default_theme" class="form-control">
+                <option value="system" {'selected' if cfg.get('default_theme') == 'system' else ''}>💻 システム連動 (OS設定)</option>
+                <option value="dark" {'selected' if cfg.get('default_theme') == 'dark' else ''}>🌙 ダークモード</option>
+                <option value="light" {'selected' if cfg.get('default_theme') == 'light' else ''}>☀️ ライトモード</option>
+              </select>
+              <div class="form-help">未選択時の既定表示テーマ</div>
+            </div>
+
+            <div class="form-group">
+              <label>保留バイパス件名接頭辞</label>
+              <input type="text" name="bypass_subject_prefix" class="form-control" value="{html.escape(cfg.get('bypass_subject_prefix', '-#-'))}">
+              <div class="form-help">件名先頭に指定すると保留およびリンク化を即時スキップ</div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>送信者通知・OTP送信元アドレス</label>
+            <input type="email" name="sender_notification_address" class="form-control" value="{html.escape(cfg.get('sender_notification_address', 'no-reply@mail.nigiri-rice.com'))}" required>
+          </div>
+
+          <div class="form-group" style="background:var(--bg-card-sub); border:1px solid var(--border-sub); padding:16px; border-radius:8px; margin:20px 0;">
+            <label style="color:#38bdf8; font-size:14px;">🔐 管理者権限ロール（Admin Roles - SSO設定）</label>
+            <input type="text" name="admin_roles" class="form-control" value="{html.escape(admin_roles_val)}" style="font-family:monospace;" required>
+            <div class="form-help" style="color:var(--text-sub); line-height:1.5; margin-top:6px;">
+              Keycloak の <code>realm_access.roles</code> に含まれるロール名をカンマ区切りで指定します。<br>
+              指定されたいずれかのロールを持つ社員アカウントが、本統合管理ダッシュボードにアクセスできます。<br>
+              例: <code>admin, iam-admin, Developer, su</code>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>管理者バックアップパスワード（変更する場合のみ入力）</label>
+            <input type="password" name="admin_password" class="form-control" placeholder="変更しない場合は空欄のまま">
+          </div>
+
+          <div style="text-align:right; margin-top:24px;">
+            <button type="submit" style="background:#2563eb; color:#fff; border:none; padding:12px 28px; border-radius:8px; font-weight:bold; font-size:14px; cursor:pointer;">
+              💾 システム設定を保存する
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function switchTab(tabId) {{
+      var s = document.getElementById('tab-shares');
+      var p = document.getElementById('tab-pending');
+      var st = document.getElementById('tab-settings');
+      if (s) s.style.display = (tabId === 'shares') ? 'block' : 'none';
+      if (p) p.style.display = (tabId === 'pending') ? 'block' : 'none';
+      if (st) st.style.display = (tabId === 'settings') ? 'block' : 'none';
+      
+      var btns = document.querySelectorAll('.tab-btn');
+      btns.forEach(function(b) {{ b.classList.remove('active'); }});
+      if (tabId === 'shares' && btns[0]) btns[0].classList.add('active');
+      if (tabId === 'pending' && btns[1]) btns[1].classList.add('active');
+      if (tabId === 'settings' && btns[2]) btns[2].classList.add('active');
+    }}
+    
+    // 一括選択用ヘルパー
+    function toggleAll(cls, checked, cntId) {{
+      var chks = document.querySelectorAll('.' + cls);
+      chks.forEach(function(c) {{ c.checked = checked; }});
+      updateCount(cls, cntId);
+    }}
+    function updateCount(cls, cntId) {{
+      var num = document.querySelectorAll('.' + cls + ':checked').length;
+      var el = document.getElementById(cntId);
+      if (el) el.textContent = num + ' 件選択中';
+    }}
+
+    // URLクエリパラメータからタブ自動選択
+    var params = new URLSearchParams(window.location.search);
+    var t = params.get('tab');
+    if (t) {{ switchTab(t); }}
+  </script>
+    {toast_html}
+  </body>
+</html>"""
+
+def render_my_portal(sso_user: dict, shares: list, pending_mails: list, message: str = "", error: str = "", is_admin: bool = False) -> str:
+    """一般社員向け 送信管理・共有リンク管理ポータル (/my/shares)"""
+    user_name = html.escape(sso_user.get("name") or sso_user.get("username", ""))
+    user_email = html.escape(sso_user.get("email", ""))
+    total_shares = len(shares)
+    pending_count = len(pending_mails)
+    
+    admin_btn = '<a href="/admin" style="background:#059669; color:#fff; text-decoration:none; padding:8px 14px; border-radius:6px; font-size:13px; font-weight:600;">🎛️ 管理者ダッシュボード</a>' if is_admin else ''
+    
+    share_rows = ""
+    for s in shares:
+        tok = s.get("token", "")
+        subj = html.escape(s.get("subject") or "無題")
+        f_count = s.get("file_count", 0)
+        size_str = format_size(s.get("total_size", 0))
+        created = s.get("created_at", "")[:16].replace("T", " ")
+        dl = s.get("download_count", 0)
+        mgmt_key = s.get("mgmt_key", "")
+        expire_days = s.get("expire_days", EXPIRE_DAYS)
+        share_url = f"{PUBLIC_BASE_URL}/share/{tok}"
+        
+        is_rev = s.get("status") == "revoked"
+        is_exp = s.get("is_expired", False)
+        exp_dt = get_share_expiry_dt(s)
+        exp_display = exp_dt.strftime("%Y-%m-%d %H:%M")
+        exp_val_input = exp_dt.strftime("%Y-%m-%dT%H:%M")
+        diff = exp_dt - datetime.now()
+        if diff.total_seconds() <= 0:
+            remain_str = "期限切れ"
+        else:
+            days = diff.days
+            hours = int(diff.seconds // 3600)
+            remain_str = f"残り{days}日{hours}時間"
+        
+        if is_rev:
+            status_badge = '<span class="badge-status-revoked">🛑 無効化中</span>'
+            act_btn = f'''<form method="POST" action="/my/api/unrevoke" style="display:inline;"><input type="hidden" name="token" value="{tok}"><button type="submit" style="background:#059669; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">再有効化</button></form>'''
+        elif is_exp:
+            status_badge = '<span class="badge-status-expired">⌛ 期限切れ</span>'
+            act_btn = f'''<form method="POST" action="/my/api/extend" style="display:inline;"><input type="hidden" name="token" value="{tok}"><input type="hidden" name="days" value="30"><button type="submit" style="background:#f59e0b; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">+30日延長</button></form>'''
+        else:
+            status_badge = '<span class="badge-status-active">🟢 共有中</span>'
+            act_btn = f'''<form method="POST" action="/my/api/revoke" onsubmit="return confirm(&quot;本当にこの共有リンクを無効化しますか？相手先からのアクセスが遮断されます。&quot;);" style="display:inline;"><input type="hidden" name="token" value="{tok}"><button type="submit" style="background:#dc2626; color:#fff; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600;">🛑 無効化</button></form>'''
+
+        date_form = f'''
+        <form method="POST" action="/my/api/set_expiry" style="display:inline-flex; align-items:center; gap:4px; margin-left:4px;" title="日時指定で有効期限を適宜、延長または短縮します">
+          <input type="hidden" name="token" value="{tok}">
+          <input type="datetime-local" name="expires_at" value="{exp_val_input}" required style="background:var(--input-bg); border:1px solid var(--input-border); color:var(--input-text); font-size:11px; padding:2px 4px; border-radius:4px; width:145px;">
+          <button type="submit" style="background:var(--bg-card-sub); border:1px solid var(--border-sub); color:var(--text-main); font-size:11px; padding:3px 8px; border-radius:4px; cursor:pointer; font-weight:600;">日時変更</button>
+        </form>
+        '''
+
+        share_rows += f"""
+        <tr>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:13px; color:var(--text-main); font-weight:600;">
+            <div style="max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{subj}">{subj}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Token: {tok[:12]}...</div>
+          </td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-sub); text-align:center;">{f_count}件 ({size_str})</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-muted);">{created}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:11px; color:var(--text-sub); text-align:center; white-space:nowrap;">
+            <div style="font-weight:600;">{exp_display}</div>
+            <div style="font-size:10px; color:var(--text-muted); margin-top:2px;">({remain_str})</div>
+          </td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:#10b981; font-weight:bold; text-align:center;">{dl}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center;">{status_badge}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center; white-space:nowrap;">
+            {act_btn}
+            {date_form}
+            <a href="/share/{tok}" target="_blank" style="margin-left:6px; color:#38bdf8; font-size:11px; text-decoration:none;">👁️ 確認</a>
+          </td>
+        </tr>
+        """
+    if not share_rows:
+        share_rows = '<tr><td colspan="7" style="padding:24px; text-align:center; color:var(--text-muted);">あなたが送信した共有ファイルはまだありません</td></tr>'
+
+    pending_rows = ""
+    for p in pending_mails:
+        c_tok = p.get("cancel_token", "")
+        subj = html.escape(p.get("subject") or "無題")
+        rcpts = html.escape(", ".join(p.get("rcpt_tos", [])))
+        att_c = len(p.get("attachments", []))
+        rem = max(0, int(p.get("expires_at", 0) - time.time()))
+        
+        pending_rows += f"""
+        <tr>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:13px; color:var(--text-main); font-weight:bold;">{subj}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:#38bdf8; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{rcpts}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:var(--text-sub); text-align:center;">{att_c} 件</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); font-size:12px; color:#f59e0b; font-weight:bold; text-align:center;">残り {rem}秒</td>
+          <td style="padding:10px 12px; border-bottom:1px solid var(--border-main); text-align:center;">
+            <form method="POST" action="/my/api/cancel" onsubmit="return confirm('本当にこのメールの送信を取り消しますか？相手先へは配送されません。');" style="display:inline;">
+              <input type="hidden" name="token" value="{c_tok}">
+              <button type="submit" style="background:#dc2626; color:#fff; border:none; padding:6px 14px; border-radius:4px; font-size:12px; cursor:pointer; font-weight:bold; box-shadow:0 2px 6px rgba(220,38,38,0.3);">
+                🛑 送信を取り消す
+              </button>
+            </form>
+          </td>
+        </tr>
+        """
+    if not pending_rows:
+        pending_rows = '<tr><td colspan="5" style="padding:16px; text-align:center; color:var(--text-muted);">現在保留中の送信メールはありません</td></tr>'
+
+    msg_html = f'<div style="background:rgba(16,185,129,0.2); border:1px solid #10b981; color:#6ee7b7; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(message)}</div>' if message else ""
+    err_html = f'<div style="background:rgba(239,68,68,0.2); border:1px solid #ef4444; color:#fca5a5; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px;">{html.escape(error)}</div>' if error else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  {get_theme_head_tags("送信管理ポータル - OmusuBI Secure Share")}
+  <style>
+    {get_common_theme_css()}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; background: var(--bg-body); color: var(--text-main); margin: 0; padding: 24px; }}
+    .container {{ max-width: 1100px; margin: 0 auto; }}
+    .header {{ display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-main); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; }}
+    .card {{ background: var(--bg-card); border: 1px solid var(--border-sub); border-radius: 12px; padding: 24px; margin-bottom: 28px; box-shadow: var(--card-shadow); }}
+    table {{ width: 100%; border-collapse: collapse; background: var(--bg-card-sub); border-radius: 8px; overflow: hidden; }}
+    th {{ background: var(--th-bg); padding: 10px 12px; font-size: 12px; color: var(--text-muted); font-weight: 600; text-align: left; border-bottom: 1px solid var(--border-main); }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <span style="font-size:32px;">📁</span>
+        <div>
+          <h1 style="font-size:20px; margin:0; font-weight:bold;">OmusuBI 社員専用 送信管理ポータル</h1>
+          <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">
+            社員アカウント: <strong>{user_name}</strong> ({user_email})
+          </div>
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        {get_theme_toggle_button()}
+        {admin_btn}
+        <a href="/auth/logout" style="background:var(--bg-card-sub); color:var(--text-main); border:1px solid var(--border-sub); text-decoration:none; padding:8px 14px; border-radius:6px; font-size:13px; font-weight:600;">ログアウト</a>
+      </div>
+    </div>
+
+    {msg_html}
+    {err_html}
+
+    <!-- 送信一時保留キュー -->
     <div class="card">
       <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
-        <h2 style="font-size:16px; margin:0; color:#f1f5f9; display:flex; align-items:center; gap:8px;">
-          <span>⏳</span> 送信保留・上長承認キュー ({pending_count} 件)
+        <h2 style="font-size:16px; margin:0; color:var(--text-main); display:flex; align-items:center; gap:8px;">
+          <span>⏳</span> 送信保留中のメール（ワンクリック送信取り消し）
         </h2>
-        <span style="font-size:12px; color:#94a3b8;">80秒保留待機中または上長承認待ちの社外宛てメール</span>
+        <span style="font-size:12px; color:var(--text-muted);">保留時間（80秒）以内であれば、社外配送を取り消せます</span>
       </div>
       <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
               <th>件名</th>
-              <th>送信元</th>
               <th>宛先</th>
               <th style="text-align:center;">添付</th>
-              <th style="text-align:center;">保留状態</th>
-              <th style="text-align:center;">アクション</th>
+              <th style="text-align:center;">保留残り時間</th>
+              <th style="text-align:center;">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -2043,24 +2920,24 @@ def render_admin_dashboard(shares: list, pending_mails: list, message: str = "",
       </div>
     </div>
 
+    <!-- 送信済み共有リンク一覧 -->
     <div class="card">
       <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
-        <h2 style="font-size:16px; margin:0; color:#f1f5f9; display:flex; align-items:center; gap:8px;">
-          <span>📁</span> 発行済み共有リンク管理 ({total_shares} 件)
+        <h2 style="font-size:16px; margin:0; color:var(--text-main); display:flex; align-items:center; gap:8px;">
+          <span>📁</span> 発行済みファイル共有リンク一覧 ({total_shares} 件)
         </h2>
-        <span style="font-size:12px; color:#94a3b8;">暗号化保管中のファイル共有リンク & キルスイッチ操作</span>
+        <span style="font-size:12px; color:var(--text-muted);">リンクの即時無効化（キルスイッチ）・再有効化・有効期限の延長</span>
       </div>
       <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
-              <th>トークン</th>
-              <th>件名</th>
-              <th>送信元</th>
-              <th style="text-align:center;">ファイル / 容量</th>
-              <th>作成日時</th>
+              <th>件名 / トークン</th>
+              <th style="text-align:center;">添付ファイル</th>
+              <th>送信日時</th>
+              <th style="text-align:center;">有効期限</th>
               <th style="text-align:center;">DL数</th>
-              <th style="text-align:center;">ステータス</th>
+              <th style="text-align:center;">状態</th>
               <th style="text-align:center;">アクション</th>
             </tr>
           </thead>
@@ -2071,8 +2948,10 @@ def render_admin_dashboard(shares: list, pending_mails: list, message: str = "",
       </div>
     </div>
   </div>
-</body>
+    {toast_html}
+  </body>
 </html>"""
+
 
 async def handle_share_page(request: web.Request):
     token = request.match_info.get("token")
@@ -2088,6 +2967,11 @@ async def handle_share_page(request: web.Request):
     session_cookie = request.cookies.get("secure_share_session")
     auth_email_hash = verify_session_token(session_cookie, token, kek)
     
+    if request.query.get("step") == "email" or request.query.get("reset") or request.query.get("change_email"):
+        resp = web.Response(text=render_page(token, meta, step="email", is_authenticated=False), content_type="text/html")
+        resp.del_cookie("secure_share_session", path="/share/")
+        return resp
+
     is_auth = (auth_email_hash is not None)
     step = "authenticated" if is_auth else "email"
     html = render_page(token, meta, step=step, is_authenticated=is_auth)
@@ -2930,14 +3814,14 @@ async def handle_download_all(request: web.Request):
     if not auth_email_hash or auth_email_hash not in meta.get("recipients_hashes", []):
         return web.HTTPFound(f"/share/{token}")
 
+    files = meta.get("files", [])
+    if not files:
+        return web.Response(text="ダウンロード可能なファイルがありません。", status=404)
+
     # ダウンロードカウント加算 & 監査ログ
     meta["download_count"] = meta.get("download_count", 0) + 1
     log_audit_event(meta, token, "download_all", f"Bulk ZIP downloaded ({len(files)} files)", request.remote or "")
 
-    files = meta.get("files", [])
-    if not files:
-        return web.Response(text="ダウンロード可能なファイルがありません。", status=404)
-        
     zip_basename = meta.get("subject") or meta.get("folder_name") or "添付ファイル一式"
     safe_zipname = re.sub(r'[\\/*?:"<>|]', "_", zip_basename).strip() or "attachments"
     zip_filename = f"{safe_zipname}.zip"
@@ -2946,14 +3830,18 @@ async def handle_download_all(request: web.Request):
     encoded_zip = urllib.parse.quote(zip_filename, encoding='utf-8')
     content_disp = f"attachment; filename=\"{ascii_zip}\"; filename*=UTF-8''{encoded_zip}"
 
-    # 一時ファイルにストリーミング書き出し
+    # 一時ファイルにストリーミング書き出し (UTF-8 EFS flag 0x800 でWindows/Mac/Linux文字化けゼロ)
     with tempfile.NamedTemporaryFile(suffix=".zip") as tmp_zip:
         with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for f_item in files:
                 fname = f_item.get("filename", "file")
                 arcname = fname.replace("\\", "/")
                 
-                with zf.open(arcname, mode="w") as zf_entry:
+                zinfo = zipfile.ZipInfo(arcname, date_time=time.localtime()[:6])
+                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                zinfo.flag_bits |= 0x800  # Language encoding flag (EFS) for UTF-8!
+                
+                with zf.open(zinfo, mode="w") as zf_entry:
                     if f_item.get("is_local_file"):
                         with open(f_item["abs_path"], "rb") as local_f:
                             while True:
@@ -3180,13 +4068,164 @@ async def handle_approve_action(request: web.Request):
     else:
         return web.Response(text="不正なアクションです。", status=400)
 
+def get_effective_redirect_uri(request: web.Request, oidc: dict, fallback_host: str = None) -> str:
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or fallback_host or ""
+    proto = request.headers.get("X-Forwarded-Proto") or "https"
+    if "print.nigiri-rice.com" in host:
+        return f"{proto}://print.nigiri-rice.com/auth/callback"
+    return oidc.get("redirect_uri", "https://fs.nigiri-rice.com/auth/callback")
+
+async def handle_auth_login(request: web.Request):
+    oidc = get_oidc_config()
+    next_url = request.query.get("next") or "/admin"
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or ""
+    
+    redirect_uri = get_effective_redirect_uri(request, oidc)
+    
+    state_payload = {
+        "next": next_url,
+        "host": host,
+        "ts": int(time.time()),
+        "rnd": secrets.token_hex(8)
+    }
+    raw_state = json.dumps(state_payload)
+    kek = get_master_key()
+    sig = hmac.new(kek, raw_state.encode("utf-8"), hashlib.sha256).hexdigest()
+    state_param = f"{urllib.parse.quote(raw_state)}.{sig}"
+    
+    auth_endpoint = f"{oidc['issuer']}/protocol/openid-connect/auth"
+    params = {
+        "client_id": oidc["client_id"],
+        "response_type": "code",
+        "scope": "openid profile email roles",
+        "redirect_uri": redirect_uri,
+        "state": state_param
+    }
+    auth_url = f"{auth_endpoint}?{urllib.parse.urlencode(params)}"
+    logger.info(f"OIDC login initiate: host='{host}', redirect_uri='{redirect_uri}', next='{next_url}'")
+    return web.HTTPFound(auth_url)
+
+async def handle_auth_callback(request: web.Request):
+    code = request.query.get("code")
+    state = request.query.get("state")
+    kek = get_master_key()
+    
+    next_url = "/admin"
+    state_host = ""
+    if state and "." in state:
+        try:
+            encoded_payload, sig = state.rsplit(".", 1)
+            raw_state = urllib.parse.unquote(encoded_payload)
+            expected_sig = hmac.new(kek, raw_state.encode("utf-8"), hashlib.sha256).hexdigest()
+            if hmac.compare_digest(sig, expected_sig):
+                payload = json.loads(raw_state)
+                next_url = payload.get("next", "/admin")
+                state_host = payload.get("host", "")
+        except Exception:
+            pass
+
+    if not code:
+        return web.Response(text="認証コードが取得できませんでした。", status=400)
+
+    oidc = get_oidc_config()
+    token_endpoint = f"{oidc.get('internal_issuer') or oidc['issuer']}/protocol/openid-connect/token"
+    
+    redirect_uri = get_effective_redirect_uri(request, oidc, fallback_host=state_host)
+    
+    data = urllib.parse.urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": oidc["client_id"],
+        "client_secret": oidc["client_secret"]
+    }).encode("utf-8")
+    
+    try:
+        req = urllib.request.Request(token_endpoint, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            token_resp = json.load(resp)
+    except Exception as e:
+        logger.error(f"Failed to exchange token with Keycloak: {e}")
+        return web.Response(text=f"SSO認証サーバーとの通信に失敗しました: {e}", status=502)
+
+    access_token = token_resp.get("access_token", "")
+    id_token = token_resp.get("id_token", "")
+    
+    def parse_jwt(token_str):
+        try:
+            parts = token_str.split(".")
+            if len(parts) >= 2:
+                padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+                import base64
+                return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    access_claims = parse_jwt(access_token)
+    id_claims = parse_jwt(id_token)
+    
+    roles = access_claims.get("realm_access", {}).get("roles", [])
+    client_roles = access_claims.get("resource_access", {}).get(oidc["client_id"], {}).get("roles", [])
+    all_roles = list(set(roles + client_roles))
+    
+    username = id_claims.get("preferred_username") or access_claims.get("preferred_username") or "user"
+    email_val = id_claims.get("email") or access_claims.get("email") or f"{username}@nigiri-rice.com"
+    name_val = id_claims.get("name") or access_claims.get("name") or username
+
+    user_info = {
+        "sub": id_claims.get("sub") or access_claims.get("sub", ""),
+        "username": username,
+        "email": email_val,
+        "name": name_val,
+        "roles": all_roles
+    }
+    
+    session_val = create_sso_session(user_info, kek)
+    
+    curr_host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or ""
+    is_print_request = ("print.nigiri-rice.com" in curr_host) or ("print.nigiri-rice.com" in state_host) or next_url.startswith("/print")
+    
+    if is_print_request:
+        if not next_url.startswith("/print"):
+            next_url = "/print"
+        final_redirect = f"https://print.nigiri-rice.com{next_url}"
+    else:
+        if next_url == "/admin" and not is_sso_admin(user_info):
+            next_url = "/my/shares?msg=ログインしました（一般社員モード）"
+        final_redirect = next_url
+        
+    resp = web.HTTPFound(final_redirect)
+    resp.set_cookie(
+        "secure_share_sso_session",
+        session_val,
+        max_age=SSO_SESSION_EXPIRY,
+        httponly=True,
+        secure=True,
+        samesite="Lax",
+        domain=".nigiri-rice.com",
+        path="/"
+    )
+    logger.info(f"SSO login successful for user {username} ({email_val}), roles={all_roles}, redirect={final_redirect}")
+    return resp
+
+async def handle_auth_logout(request: web.Request):
+    oidc = get_oidc_config()
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or ""
+    post_logout = "https://print.nigiri-rice.com/print" if "print.nigiri-rice.com" in host else "https://fs.nigiri-rice.com/auth/login"
+    resp = web.HTTPFound(f"{oidc['issuer']}/protocol/openid-connect/logout?post_logout_redirect_uri={post_logout}")
+    resp.del_cookie("secure_share_sso_session", domain=".nigiri-rice.com", path="/" )
+    resp.del_cookie("secure_share_admin_session", path="/")
+    return resp
+
 async def handle_admin_login(request: web.Request):
-    """管理者ログイン"""
+    """管理者ログイン (SSOログイン ＆ バックアップパスワード両対応)"""
     kek = get_master_key()
     if request.method == "POST":
         data = await request.post()
         pwd = data.get("password", "")
-        if pwd and hmac.compare_digest(pwd, ADMIN_PASSWORD):
+        admin_pwd = get_admin_password()
+        if pwd and hmac.compare_digest(pwd, admin_pwd):
             session_val = create_admin_session(kek)
             resp = web.HTTPFound("/admin")
             resp.set_cookie(
@@ -3197,28 +4236,37 @@ async def handle_admin_login(request: web.Request):
                 secure=True,
                 samesite="Lax"
             )
-            logger.info("Admin logged in successfully.")
+            logger.info("Admin logged in successfully via backup password.")
             return resp
         else:
             logger.warning("Admin login failed: invalid password.")
             return web.Response(text=render_admin_login(error="パスワードが正しくありません。"), content_type="text/html", status=401)
             
+    sso_user = get_current_sso_user(request, kek)
+    if is_sso_admin(sso_user):
+        return web.HTTPFound("/admin")
     admin_cookie = request.cookies.get("secure_share_admin_session")
     if verify_admin_session(admin_cookie, kek):
         return web.HTTPFound("/admin")
     return web.Response(text=render_admin_login(), content_type="text/html")
 
 async def handle_admin_logout(request: web.Request):
-    resp = web.HTTPFound("/admin/login")
-    resp.del_cookie("secure_share_admin_session")
-    return resp
+    return await handle_auth_logout(request)
 
 async def handle_admin_dashboard(request: web.Request):
-    """管理者ダッシュボード"""
+    """管理者ダッシュボード (SSO Adminロールまたは管理者セッション必須)"""
     kek = get_master_key()
-    admin_cookie = request.cookies.get("secure_share_admin_session")
-    if not verify_admin_session(admin_cookie, kek):
-        return web.HTTPFound("/admin/login")
+    sso_user = get_current_sso_user(request, kek)
+    legacy_admin = verify_admin_session(request.cookies.get("secure_share_admin_session"), kek)
+    
+    if not sso_user and not legacy_admin:
+        return web.HTTPFound("/auth/login?next=/admin")
+        
+    if sso_user and not is_sso_admin(sso_user) and not legacy_admin:
+        cfg = get_system_config()
+        admin_roles = cfg.get("admin_roles", ["admin", "iam-admin", "Developer", "su"])
+        html = render_forbidden_page(sso_user, admin_roles)
+        return web.Response(text=html, status=403, content_type="text/html")
         
     shares = []
     if os.path.exists(STORAGE_DIR):
@@ -3234,6 +4282,7 @@ async def handle_admin_dashboard(request: web.Request):
                         "file_count": len(meta.get("files", [])),
                         "total_size": meta.get("total_size", 0),
                         "created_at": meta.get("created_at", ""),
+                        "expire_days": meta.get("expire_days", EXPIRE_DAYS),
                         "download_count": meta.get("download_count", 0),
                         "status": meta.get("status", "active"),
                         "mgmt_key": meta.get("mgmt_key", ""),
@@ -3256,14 +4305,17 @@ async def handle_admin_dashboard(request: web.Request):
     pending_mails.sort(key=lambda p: p.get("created_at", ""), reverse=True)
 
     msg = request.query.get("msg", "")
-    html = render_admin_dashboard(shares, pending_mails, message=msg)
+    err = request.query.get("error", "")
+    tab = request.query.get("tab", "shares")
+    html = render_admin_dashboard(shares, pending_mails, message=msg, error=err, active_tab=tab, sso_user=sso_user)
     return web.Response(text=html, content_type="text/html")
 
 async def handle_admin_action(request: web.Request):
     """ダッシュボードからの管理者クイックアクション"""
     kek = get_master_key()
-    admin_cookie = request.cookies.get("secure_share_admin_session")
-    if not verify_admin_session(admin_cookie, kek):
+    sso_user = get_current_sso_user(request, kek)
+    legacy_admin = verify_admin_session(request.cookies.get("secure_share_admin_session"), kek)
+    if not is_sso_admin(sso_user) and not legacy_admin:
         return web.HTTPFound("/admin/login")
         
     data = await request.post()
@@ -3277,15 +4329,370 @@ async def handle_admin_action(request: web.Request):
     if action == "revoke":
         meta["status"] = "revoked"
         meta["revoked_at"] = datetime.now().isoformat()
-        meta["revoked_by"] = "admin"
+        meta["revoked_by"] = sso_user.get("username") if sso_user else "admin"
         log_audit_event(meta, token, "revoke", "Admin quick revoked", request.remote or "")
-        return web.HTTPFound(f"/admin?msg=トークン {token} を即時無効化しました")
+        return web.HTTPFound(f"/admin?msg=トークン {token} を無効化しました")
     elif action == "unrevoke":
         meta["status"] = "active"
         log_audit_event(meta, token, "unrevoke", "Admin quick unrevoked", request.remote or "")
         return web.HTTPFound(f"/admin?msg=トークン {token} を再有効化しました")
         
     return web.HTTPFound("/admin")
+
+async def handle_admin_bulk_shares(request: web.Request):
+    """管理者画面専用: 共有リンクの一括無効化・一括再有効化"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    legacy_admin = verify_admin_session(request.cookies.get("secure_share_admin_session"), kek)
+    if not is_sso_admin(sso_user) and not legacy_admin:
+        return web.HTTPFound("/admin/login")
+        
+    data = await request.post()
+    action = data.get("action", "")
+    tokens = data.getall("tokens", [])
+    if not tokens:
+        return web.HTTPFound("/admin?error=対象の共有リンクが選択されていません")
+        
+    count = 0
+    now_iso = datetime.now().isoformat()
+    actor = sso_user.get("username") if sso_user else "admin"
+    
+    if action == "revoke":
+        for tok in tokens:
+            meta = get_normalized_metadata(tok)
+            if meta:
+                meta["status"] = "revoked"
+                meta["revoked_at"] = now_iso
+                meta["revoked_by"] = actor
+                log_audit_event(meta, tok, "bulk_revoke", f"Bulk revoked by admin {actor}", request.remote or "")
+                count += 1
+        return web.HTTPFound(f"/admin?msg={count} 件の共有リンクを一括無効化しました")
+    elif action == "unrevoke":
+        for tok in tokens:
+            meta = get_normalized_metadata(tok)
+            if meta:
+                meta["status"] = "active"
+                meta["unrevoked_at"] = now_iso
+                log_audit_event(meta, tok, "bulk_unrevoke", f"Bulk unrevoked by admin {actor}", request.remote or "")
+                count += 1
+        return web.HTTPFound(f"/admin?msg={count} 件の共有リンクを一括再有効化しました")
+    
+    return web.HTTPFound("/admin")
+
+async def handle_admin_bulk_pending(request: web.Request):
+    """管理者画面専用: 送信保留メールの一括送信許可（承認）・一括取り消し"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    legacy_admin = verify_admin_session(request.cookies.get("secure_share_admin_session"), kek)
+    if not is_sso_admin(sso_user) and not legacy_admin:
+        return web.HTTPFound("/admin/login")
+        
+    data = await request.post()
+    action = data.get("action", "")
+    tokens = data.getall("tokens", [])
+    if not tokens:
+        return web.HTTPFound("/admin?tab=pending&error=対象の保留メールが選択されていません")
+        
+    count = 0
+    now_iso = datetime.now().isoformat()
+    actor = sso_user.get("username") if sso_user else "admin"
+    
+    if os.path.exists(PENDING_DIR):
+        for fname in os.listdir(PENDING_DIR):
+            if fname.endswith(".json"):
+                fpath = os.path.join(PENDING_DIR, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        pdata = json.load(f)
+                    a_tok = pdata.get("approve_token")
+                    if a_tok in tokens and pdata.get("status") == "pending":
+                        if action == "approve":
+                            pdata["status"] = "approved"
+                            pdata["approved_at"] = now_iso
+                            pdata["approved_by"] = actor
+                            with open(fpath, "w", encoding="utf-8") as f:
+                                json.dump(pdata, f, indent=2, ensure_ascii=False)
+                            logger.info(f"Outbound mail BULK APPROVED by admin {actor}: approve_token={a_tok}")
+                            count += 1
+                        elif action == "reject":
+                            pdata["status"] = "rejected"
+                            pdata["rejected_at"] = now_iso
+                            pdata["reject_reason"] = f"管理者({actor})による一括送信取り消し"
+                            with open(fpath, "w", encoding="utf-8") as f:
+                                json.dump(pdata, f, indent=2, ensure_ascii=False)
+                            logger.info(f"Outbound mail BULK REJECTED by admin {actor}: approve_token={a_tok}")
+                            count += 1
+                except Exception as e:
+                    logger.error(f"Error processing bulk pending mail {fname}: {e}")
+                    
+    if action == "approve":
+        return web.HTTPFound(f"/admin?tab=pending&msg={count} 件のメールを一括送信許可（承認）しました。直ちに宛先へ配送されます。")
+    elif action == "reject":
+        return web.HTTPFound(f"/admin?tab=pending&msg={count} 件の保留メールを一括送信取り消ししました。")
+    return web.HTTPFound("/admin?tab=pending")
+
+async def handle_admin_settings(request: web.Request):
+    """管理者設定保存API"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    legacy_admin = verify_admin_session(request.cookies.get("secure_share_admin_session"), kek)
+    if not is_sso_admin(sso_user) and not legacy_admin:
+        return web.HTTPFound("/auth/login?next=/admin")
+        
+    data = await request.post()
+    cfg = get_system_config()
+    
+    if "outbound_delay_seconds" in data:
+        try:
+            cfg["outbound_delay_seconds"] = int(data["outbound_delay_seconds"])
+        except ValueError:
+            pass
+    if "bcc_convert_threshold" in data:
+        try:
+            cfg["bcc_convert_threshold"] = int(data["bcc_convert_threshold"])
+        except ValueError:
+            pass
+    if "default_expire_days" in data:
+        try:
+            cfg["default_expire_days"] = int(data["default_expire_days"])
+        except ValueError:
+            pass
+    if "otp_expiry_minutes" in data:
+        try:
+            cfg["otp_expiry_minutes"] = int(data["otp_expiry_minutes"])
+        except ValueError:
+            pass
+    if "otp_max_attempts" in data:
+        try:
+            cfg["otp_max_attempts"] = int(data["otp_max_attempts"])
+        except ValueError:
+            pass
+    if "data_size_limit_gb" in data:
+        try:
+            cfg["data_size_limit_gb"] = int(data["data_size_limit_gb"])
+        except ValueError:
+            pass
+    if "default_theme" in data:
+        cfg["default_theme"] = data["default_theme"]
+    if "sender_notification_address" in data:
+        cfg["sender_notification_address"] = data["sender_notification_address"].strip()
+    if "company_name" in data:
+        cfg["company_name"] = data["company_name"].strip()
+    if "bypass_subject_prefix" in data:
+        cfg["bypass_subject_prefix"] = data["bypass_subject_prefix"].strip()
+    if "admin_roles" in data:
+        raw_roles = data["admin_roles"].replace("、", ",").split(",")
+        cfg["admin_roles"] = [r.strip() for r in raw_roles if r.strip()]
+    if data.get("admin_password"):
+        cfg["admin_password"] = data["admin_password"].strip()
+        
+    save_system_config(cfg)
+    logger.info(f"System settings updated: {cfg}")
+    return web.HTTPFound("/admin?tab=settings&msg=システム設定を正常に保存しました")
+
+async def handle_my_shares(request: web.Request):
+    """一般社員向け 送信管理ポータル (/my/shares)"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    if not sso_user:
+        return web.HTTPFound("/auth/login?next=/my/shares")
+        
+    user_email = sso_user.get("email", "").lower().strip()
+    username = sso_user.get("username", "").lower().strip()
+    is_admin = is_sso_admin(sso_user)
+    
+    user_shares = []
+    if os.path.exists(STORAGE_DIR):
+        for fname in os.listdir(STORAGE_DIR):
+            if fname.endswith(".meta") and not fname.startswith("test_"):
+                tok = fname[:-5]
+                meta = get_normalized_metadata(tok)
+                if meta:
+                    mail_from = meta.get("mail_from", "").lower().strip()
+                    if is_admin or (user_email and user_email in mail_from) or (username and username in mail_from):
+                        user_shares.append({
+                            "token": tok,
+                            "subject": meta.get("subject", ""),
+                            "mail_from": meta.get("mail_from", ""),
+                            "file_count": len(meta.get("files", [])),
+                            "total_size": meta.get("total_size", 0),
+                            "created_at": meta.get("created_at", ""),
+                            "expire_days": meta.get("expire_days", EXPIRE_DAYS),
+                            "download_count": meta.get("download_count", 0),
+                            "status": meta.get("status", "active"),
+                            "mgmt_key": meta.get("mgmt_key", ""),
+                            "is_expired": is_share_expired(meta)
+                        })
+    user_shares.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+    
+    user_pending = []
+    if os.path.exists(PENDING_DIR):
+        for fname in os.listdir(PENDING_DIR):
+            if fname.endswith(".json"):
+                fpath = os.path.join(PENDING_DIR, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        pdata = json.load(f)
+                        if pdata.get("status") == "pending":
+                            mail_from = pdata.get("mail_from", "").lower().strip()
+                            if is_admin or (user_email and user_email in mail_from) or (username and username in mail_from):
+                                user_pending.append(pdata)
+                except Exception:
+                    pass
+    user_pending.sort(key=lambda p: p.get("created_at", ""), reverse=True)
+    
+    msg = request.query.get("msg", "")
+    err = request.query.get("error", "")
+    html = render_my_portal(sso_user, user_shares, user_pending, message=msg, error=err, is_admin=is_admin)
+    return web.Response(text=html, content_type="text/html")
+
+async def handle_my_cancel(request: web.Request):
+    """社員ポータルからの送信メール取り消し"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    if not sso_user:
+        return web.HTTPFound("/auth/login?next=/my/shares")
+        
+    data = await request.post()
+    cancel_token = data.get("token", "")
+    pending_file = os.path.join(PENDING_DIR, f"{cancel_token}.json")
+    if not os.path.exists(pending_file):
+        return web.HTTPFound("/my/shares?error=保留メールが見つかりませんでした")
+        
+    try:
+        with open(pending_file, "r", encoding="utf-8") as f:
+            pdata = json.load(f)
+        user_email = sso_user.get("email", "").lower().strip()
+        mail_from = pdata.get("mail_from", "").lower().strip()
+        if not is_sso_admin(sso_user) and user_email not in mail_from:
+            return web.HTTPFound("/my/shares?error=このメールの取り消し権限がありません")
+            
+        pdata["status"] = "cancelled"
+        pdata["cancelled_at"] = datetime.now().isoformat()
+        with open(pending_file, "w", encoding="utf-8") as f:
+            json.dump(pdata, f, indent=2, ensure_ascii=False)
+        logger.info(f"Outbound mail cancelled by user {sso_user.get('username')}: {cancel_token}")
+        return web.HTTPFound("/my/shares?msg=メールの送信を取り消しました。相手先へは配送されません。")
+    except Exception as e:
+        logger.error(f"Error cancelling outbound mail: {e}")
+        return web.HTTPFound(f"/my/shares?error=取り消し処理に失敗しました: {e}")
+
+async def handle_my_revoke(request: web.Request):
+    """社員ポータルからの共有リンク即時無効化（キルスイッチ）"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    if not sso_user:
+        return web.HTTPFound("/auth/login?next=/my/shares")
+        
+    data = await request.post()
+    token = data.get("token", "")
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.HTTPFound("/my/shares?error=共有リンクが見つかりません")
+        
+    user_email = sso_user.get("email", "").lower().strip()
+    mail_from = meta.get("mail_from", "").lower().strip()
+    if not is_sso_admin(sso_user) and user_email not in mail_from:
+        return web.HTTPFound("/my/shares?error=このリンクの操作権限がありません")
+        
+    meta["status"] = "revoked"
+    meta["revoked_at"] = datetime.now().isoformat()
+    meta["revoked_by"] = sso_user.get("username")
+    log_audit_event(meta, token, "revoke", f"Revoked by employee {sso_user.get('username')}", request.remote or "")
+    return web.HTTPFound("/my/shares?msg=共有リンクを無効化しました。受取人のアクセスは直ちに遮断されました。")
+
+async def handle_my_unrevoke(request: web.Request):
+    """社員ポータルからの共有リンク再有効化"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    if not sso_user:
+        return web.HTTPFound("/auth/login?next=/my/shares")
+        
+    data = await request.post()
+    token = data.get("token", "")
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.HTTPFound("/my/shares?error=共有リンクが見つかりません")
+        
+    user_email = sso_user.get("email", "").lower().strip()
+    mail_from = meta.get("mail_from", "").lower().strip()
+    if not is_sso_admin(sso_user) and user_email not in mail_from:
+        return web.HTTPFound("/my/shares?error=このリンクの操作権限がありません")
+        
+    meta["status"] = "active"
+    log_audit_event(meta, token, "unrevoke", f"Unrevoked by employee {sso_user.get('username')}", request.remote or "")
+    return web.HTTPFound("/my/shares?msg=共有リンクを再有効化しました。")
+
+async def handle_my_extend(request: web.Request):
+    """社員ポータルからの共有有効期限延長"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    if not sso_user:
+        return web.HTTPFound("/auth/login?next=/my/shares")
+        
+    data = await request.post()
+    token = data.get("token", "")
+    try:
+        add_days = int(data.get("days", 30))
+    except ValueError:
+        add_days = 30
+        
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.HTTPFound("/my/shares?error=共有リンクが見つかりません")
+        
+    user_email = sso_user.get("email", "").lower().strip()
+    mail_from = meta.get("mail_from", "").lower().strip()
+    if not is_sso_admin(sso_user) and user_email not in mail_from:
+        return web.HTTPFound("/my/shares?error=このリンクの操作権限がありません")
+        
+    cur_days = meta.get("expire_days", EXPIRE_DAYS)
+    meta["expire_days"] = cur_days + add_days
+    # expires_at が設定されている場合も加算
+    if meta.get("expires_at"):
+        try:
+            old_dt = datetime.fromisoformat(meta["expires_at"])
+            meta["expires_at"] = (old_dt + timedelta(days=add_days)).isoformat()
+        except Exception:
+            pass
+    log_audit_event(meta, token, "extend_expiry", f"Extended by {add_days} days (total {meta['expire_days']} days) by {sso_user.get('username')}", request.remote or "")
+    return web.HTTPFound(f"/my/shares?msg=共有リンクの有効期限を {add_days} 日間延長しました（合計 {meta['expire_days']} 日間）")
+
+async def handle_my_set_expiry(request: web.Request):
+    """社員ポータルからの共有有効期限の日時指定変更（延長・短縮）"""
+    kek = get_master_key()
+    sso_user = get_current_sso_user(request, kek)
+    if not sso_user:
+        return web.HTTPFound("/auth/login?next=/my/shares")
+        
+    data = await request.post()
+    token = data.get("token", "")
+    new_exp_raw = (data.get("expires_at") or "").strip()
+    
+    meta = get_normalized_metadata(token)
+    if not meta:
+        return web.HTTPFound("/my/shares?error=共有リンクが見つかりません")
+        
+    user_email = sso_user.get("email", "").lower().strip()
+    mail_from = meta.get("mail_from", "").lower().strip()
+    if not is_sso_admin(sso_user) and user_email not in mail_from:
+        return web.HTTPFound("/my/shares?error=このリンクの操作権限がありません")
+        
+    try:
+        new_dt = datetime.fromisoformat(new_exp_raw)
+    except Exception as e:
+        return web.HTTPFound(f"/my/shares?error=指定された日時の形式が正しくありません: {e}")
+        
+    meta["expires_at"] = new_dt.isoformat()
+    try:
+        c_dt = datetime.fromisoformat(meta.get("created_at", datetime.now().isoformat()))
+        meta["expire_days"] = max(1, (new_dt - c_dt).days)
+    except Exception:
+        pass
+        
+    formatted_dt = new_dt.strftime("%Y-%m-%d %H:%M")
+    log_audit_event(meta, token, "set_expiry", f"Expiry updated to {formatted_dt} by {sso_user.get('username')}", request.remote or "")
+    return web.HTTPFound(f"/my/shares?msg=共有リンクの有効期限を {formatted_dt} に変更しました")
 
 def init_app():
     app = web.Application()
@@ -3313,6 +4720,11 @@ def init_app():
     app.router.add_post("/share/{token}/api/revoke", handle_api_revoke)
     app.router.add_post("/share/{token}/api/unrevoke", handle_api_unrevoke)
 
+    # Keycloak SSO 認証エンドポイント
+    app.router.add_get("/auth/login", handle_auth_login)
+    app.router.add_get("/auth/callback", handle_auth_callback)
+    app.router.add_get("/auth/logout", handle_auth_logout)
+
     # 統合管理ダッシュボード
     app.router.add_get("/admin", handle_admin_dashboard)
     app.router.add_get("/manage", lambda req: web.HTTPFound("/admin"))
@@ -3320,6 +4732,28 @@ def init_app():
     app.router.add_post("/admin/login", handle_admin_login)
     app.router.add_get("/admin/logout", handle_admin_logout)
     app.router.add_post("/admin/api/action", handle_admin_action)
+    app.router.add_post("/admin/api/settings", handle_admin_settings)
+    app.router.add_post("/admin/api/bulk-shares", handle_admin_bulk_shares)
+    app.router.add_post("/admin/api/bulk-pending", handle_admin_bulk_pending)
+
+    # 一般社員専用 送信管理ポータル
+    app.router.add_get("/my/shares", handle_my_shares)
+    app.router.add_get("/my", lambda req: web.HTTPFound("/my/shares"))
+    app.router.add_get("/portal", lambda req: web.HTTPFound("/my/shares"))
+    app.router.add_post("/my/api/cancel", handle_my_cancel)
+    app.router.add_post("/my/api/revoke", handle_my_revoke)
+    app.router.add_post("/my/api/unrevoke", handle_my_unrevoke)
+    app.router.add_post("/my/api/extend", handle_my_extend)
+    app.router.add_post("/my/api/set_expiry", handle_my_set_expiry)
+
+    # === OmusuBI Secure Print (オンデマンド印刷 ＆ 複合機認証マネージャー) ===
+    try:
+        from secure_print_endpoints import register_secure_print_routes
+        register_secure_print_routes(app, get_master_key, get_current_sso_user)
+        logger.info("Secure Print routes hooked into application successfully.")
+    except Exception as e:
+        logger.error(f"Failed to hook Secure Print routes: {e}")
+
     return app
 
 if __name__ == "__main__":
